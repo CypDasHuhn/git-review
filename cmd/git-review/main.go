@@ -314,13 +314,14 @@ func acceptGroup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	*path = strings.TrimSuffix(*path, "/")
 	for index := range groups {
 		if groups[index].Name != *name {
 			continue
 		}
 		var selected, remaining []session.Hunk
 		for _, hunk := range groups[index].Hunks {
-			if hunk.Path == *path {
+			if hunk.Path == *path || strings.HasPrefix(hunk.Path, *path+"/") {
 				selected = append(selected, hunk)
 			} else {
 				remaining = append(remaining, hunk)

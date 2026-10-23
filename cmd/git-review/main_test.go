@@ -50,11 +50,14 @@ func TestChangesAndGroupsTrackCurrentHunks(t *testing.T) {
 	runCommand(t, repository, "git", "init", "--initial-branch=main")
 	runCommand(t, repository, "git", "config", "user.email", "test@example.com")
 	runCommand(t, repository, "git", "config", "user.name", "Test User")
-	file := filepath.Join(repository, "example.txt")
+	if err := os.Mkdir(filepath.Join(repository, "folder"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(repository, "folder", "example.txt")
 	if err := os.WriteFile(file, []byte("one\ntwo\nthree\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "add", "folder/example.txt")
 	runCommand(t, repository, "git", "commit", "-m", "initial")
 
 	binary := filepath.Join(t.TempDir(), "git-review")
@@ -63,7 +66,7 @@ func TestChangesAndGroupsTrackCurrentHunks(t *testing.T) {
 	if err := os.WriteFile(file, []byte("one\ntwo changed\nthree\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "add", "folder/example.txt")
 	runCommand(t, repository, "git", "commit", "-m", "change example")
 
 	rawChanges := runCommand(t, repository, binary, "changes", "--json")
@@ -87,7 +90,7 @@ func TestChangesAndGroupsTrackCurrentHunks(t *testing.T) {
 	if len(groups) != 1 || groups[0].Name != "formatting" || len(groups[0].Hunks) != 1 || groups[0].Hunks[0] != hunk {
 		t.Fatalf("groups = %#v, want one group containing %#v", groups, hunk)
 	}
-	runCommand(t, repository, binary, "group", "accept", "--name", "formatting", "--path", hunk.Path)
+	runCommand(t, repository, binary, "group", "accept", "--name", "formatting", "--path", "folder")
 	groups = nil
 	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
 		t.Fatal(err)
@@ -96,7 +99,7 @@ func TestChangesAndGroupsTrackCurrentHunks(t *testing.T) {
 		t.Fatalf("groups = %#v, want empty after acceptance", groups)
 	}
 	reviewed := session.ReviewedRef("main")
-	if content := runCommand(t, repository, "git", "show", reviewed+":example.txt"); content != "one\ntwo changed\nthree\n" {
+	if content := runCommand(t, repository, "git", "show", reviewed+":folder/example.txt"); content != "one\ntwo changed\nthree\n" {
 		t.Fatalf("reviewed content = %q", content)
 	}
 }
