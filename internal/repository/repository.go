@@ -154,23 +154,28 @@ func (r Repository) Log(ctx context.Context, ref string) (string, error) {
 }
 
 func (r Repository) DiffHunks(ctx context.Context, base, target string) ([]session.Hunk, error) {
-	output, err := git(ctx, r.Root, "diff", "--no-ext-diff", "--no-renames", "--unified=0", base+".."+target, "--")
+	output, err := git(ctx, r.Root, "diff", "--no-ext-diff", "--unified=0", base+".."+target, "--")
 	if err != nil {
 		return nil, err
 	}
 	var hunks []session.Hunk
 	path := ""
+	oldPath := ""
 	for _, line := range strings.Split(output, "\n") {
 		if strings.HasPrefix(line, "diff --git ") {
 			path = ""
+			oldPath = ""
 			continue
 		}
 		if strings.HasPrefix(line, "+++ b/") {
 			path = strings.TrimPrefix(line, "+++ b/")
 			continue
 		}
-		if strings.HasPrefix(line, "--- a/") && path == "" {
-			path = strings.TrimPrefix(line, "--- a/")
+		if strings.HasPrefix(line, "--- a/") {
+			oldPath = strings.TrimPrefix(line, "--- a/")
+			if path == "" {
+				path = oldPath
+			}
 			continue
 		}
 		if !strings.HasPrefix(line, "@@ ") {
@@ -181,7 +186,7 @@ func (r Repository) DiffHunks(ctx context.Context, base, target string) ([]sessi
 			continue
 		}
 		hunks = append(hunks, session.Hunk{
-			Path: path, OldStart: oldStart, OldLines: oldLines, NewStart: newStart, NewLines: newLines,
+			Path: path, OldPath: oldPath, OldStart: oldStart, OldLines: oldLines, NewStart: newStart, NewLines: newLines,
 		})
 	}
 	return hunks, nil
@@ -214,6 +219,13 @@ func (r Repository) CreateGroupProjection(ctx context.Context, base, target, ref
 	if _, err := gitWithInput(ctx, r.Root, env, patch, "apply", "--cached", "--unidiff-zero"); err != nil {
 		return "", err
 	}
+	for _, hunk := range hunks {
+		if hunk.OldPath != "" && hunk.OldPath != hunk.Path {
+			if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", hunk.OldPath); err != nil {
+				return "", err
+			}
+		}
+	}
 	tree, err := gitWithEnv(ctx, r.Root, env, "write-tree")
 	if err != nil {
 		return "", err
@@ -229,7 +241,7 @@ func (r Repository) CreateGroupProjection(ctx context.Context, base, target, ref
 }
 
 func (r Repository) patchForHunks(ctx context.Context, base, target string, selected []session.Hunk) (string, error) {
-	output, err := git(ctx, r.Root, "diff", "--no-ext-diff", "--no-renames", "--unified=0", base+".."+target, "--")
+	output, err := git(ctx, r.Root, "diff", "--no-ext-diff", "--unified=0", base+".."+target, "--")
 	if err != nil {
 		return "", err
 	}
@@ -239,13 +251,14 @@ func (r Repository) patchForHunks(ctx context.Context, base, target string, sele
 	}
 	var result, prefix, hunk []string
 	path := ""
+	oldPath := ""
 	addedPrefix := false
 	flush := func() {
 		if len(hunk) == 0 {
 			return
 		}
 		oldStart, oldLines, newStart, newLines, ok := parseHunkHeader(hunk[0])
-		if ok && wanted[session.Hunk{Path: path, OldStart: oldStart, OldLines: oldLines, NewStart: newStart, NewLines: newLines}] {
+		if ok && wanted[session.Hunk{Path: path, OldPath: oldPath, OldStart: oldStart, OldLines: oldLines, NewStart: newStart, NewLines: newLines}] {
 			if !addedPrefix {
 				result = append(result, prefix...)
 				addedPrefix = true
@@ -259,6 +272,7 @@ func (r Repository) patchForHunks(ctx context.Context, base, target string, sele
 			flush()
 			prefix = []string{line}
 			path = ""
+			oldPath = ""
 			addedPrefix = false
 			continue
 		}
@@ -275,8 +289,11 @@ func (r Repository) patchForHunks(ctx context.Context, base, target string, sele
 		if strings.HasPrefix(line, "+++ b/") {
 			path = strings.TrimPrefix(line, "+++ b/")
 		}
-		if strings.HasPrefix(line, "--- a/") && path == "" {
-			path = strings.TrimPrefix(line, "--- a/")
+		if strings.HasPrefix(line, "--- a/") {
+			oldPath = strings.TrimPrefix(line, "--- a/")
+			if path == "" {
+				path = oldPath
+			}
 		}
 	}
 	flush()

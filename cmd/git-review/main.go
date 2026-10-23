@@ -405,7 +405,8 @@ func assignGroup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if !containsHunk(hunks, hunk) {
+	hunk, found := matchingHunk(hunks, hunk)
+	if !found {
 		return errors.New("the requested hunk is not in the current review diff")
 	}
 	store := session.NewStore(repo.GitDir)
@@ -422,6 +423,15 @@ func assignGroup(ctx context.Context, args []string) error {
 		}
 	}
 	return store.SaveGroups(state.WorkBranch, append(groups, session.Group{Name: *name, Hunks: []session.Hunk{hunk}}))
+}
+
+func matchingHunk(hunks []session.Hunk, candidate session.Hunk) (session.Hunk, bool) {
+	for _, hunk := range hunks {
+		if hunk.Path == candidate.Path && hunk.OldStart == candidate.OldStart && hunk.OldLines == candidate.OldLines && hunk.NewStart == candidate.NewStart && hunk.NewLines == candidate.NewLines {
+			return hunk, true
+		}
+	}
+	return session.Hunk{}, false
 }
 
 func listGroups(ctx context.Context, args []string) error {

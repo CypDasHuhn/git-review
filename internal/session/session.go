@@ -35,6 +35,7 @@ type Store struct {
 
 type Hunk struct {
 	Path     string `json:"path"`
+	OldPath  string `json:"oldPath,omitempty"`
 	OldStart int    `json:"oldStart"`
 	OldLines int    `json:"oldLines"`
 	NewStart int    `json:"newStart"`
