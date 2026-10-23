@@ -288,9 +288,65 @@ func group(ctx context.Context, args []string) error {
 		return listGroups(ctx, args[1:])
 	case "view":
 		return viewGroup(ctx, args[1:])
+	case "accept":
+		return acceptGroup(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown group command %q", args[0])
 	}
+}
+
+func acceptGroup(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("group accept", flag.ContinueOnError)
+	name := flags.String("name", "", "review group name")
+	path := flags.String("path", "", "changed file path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *name == "" || *path == "" {
+		return errors.New("group accept requires --name and --path")
+	}
+	repo, state, err := currentSession(ctx)
+	if err != nil {
+		return err
+	}
+	store := session.NewStore(repo.GitDir)
+	groups, err := store.LoadGroups(state.WorkBranch)
+	if err != nil {
+		return err
+	}
+	for index := range groups {
+		if groups[index].Name != *name {
+			continue
+		}
+		var selected, remaining []session.Hunk
+		for _, hunk := range groups[index].Hunks {
+			if hunk.Path == *path {
+				selected = append(selected, hunk)
+			} else {
+				remaining = append(remaining, hunk)
+			}
+		}
+		if len(selected) == 0 {
+			return fmt.Errorf("review group %q has no hunks for %q", *name, *path)
+		}
+		commit, err := repo.CreateGroupProjection(ctx, state.ReviewedRef, "HEAD", session.GroupRef(state.WorkBranch, "accept-"+*name+"-"+*path), "accept "+*name+": "+*path, selected)
+		if err != nil {
+			return err
+		}
+		if err := repo.ResetRef(ctx, state.ReviewedRef, commit); err != nil {
+			return err
+		}
+		if len(remaining) == 0 {
+			groups = append(groups[:index], groups[index+1:]...)
+		} else {
+			groups[index].Hunks = remaining
+		}
+		if err := store.SaveGroups(state.WorkBranch, groups); err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]string{"commit": commit})
+	}
+	return fmt.Errorf("review group %q does not exist", *name)
 }
 
 func viewGroup(ctx context.Context, args []string) error {

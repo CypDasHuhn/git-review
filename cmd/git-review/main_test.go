@@ -87,6 +87,18 @@ func TestChangesAndGroupsTrackCurrentHunks(t *testing.T) {
 	if len(groups) != 1 || groups[0].Name != "formatting" || len(groups[0].Hunks) != 1 || groups[0].Hunks[0] != hunk {
 		t.Fatalf("groups = %#v, want one group containing %#v", groups, hunk)
 	}
+	runCommand(t, repository, binary, "group", "accept", "--name", "formatting", "--path", hunk.Path)
+	groups = nil
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("groups = %#v, want empty after acceptance", groups)
+	}
+	reviewed := session.ReviewedRef("main")
+	if content := runCommand(t, repository, "git", "show", reviewed+":example.txt"); content != "one\ntwo changed\nthree\n" {
+		t.Fatalf("reviewed content = %q", content)
+	}
 }
 
 func number(value int) string {
