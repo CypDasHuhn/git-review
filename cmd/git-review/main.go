@@ -493,6 +493,11 @@ func usage() error {
 	git-review undo
 	git-review history
 	git-review reset --commit <commit>
+	git-review changes --json
+	git-review group list --json
+	git-review group assign --name <name> --path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>
+	git-review group view --name <name>
+	git-review group accept --name <name> --path <path>
 `)+"\n")
 	return err
 }
