@@ -104,6 +104,47 @@ func TestChangesAndGroupsTrackCurrentHunks(t *testing.T) {
 	}
 }
 
+func TestGroupsPruneAcceptedHunks(t *testing.T) {
+	repository := t.TempDir()
+	runCommand(t, repository, "git", "init", "--initial-branch=main")
+	runCommand(t, repository, "git", "config", "user.email", "test@example.com")
+	runCommand(t, repository, "git", "config", "user.name", "Test User")
+	file := filepath.Join(repository, "example.txt")
+	if err := os.WriteFile(file, []byte("before\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "initial")
+
+	binary := filepath.Join(t.TempDir(), "git-review")
+	runCommand(t, projectRoot(t), "go", "build", "-o", binary, ".")
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	if err := os.WriteFile(file, []byte("after\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "change example")
+
+	var hunks []session.Hunk
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "changes", "--json")), &hunks); err != nil {
+		t.Fatal(err)
+	}
+	hunk := hunks[0]
+	runCommand(t, repository, binary, "group", "assign", "--name", "example", "--path", hunk.Path,
+		"--old-start", number(hunk.OldStart), "--old-lines", number(hunk.OldLines),
+		"--new-start", number(hunk.NewStart), "--new-lines", number(hunk.NewLines))
+
+	runCommand(t, repository, "git", "update-ref", session.ReviewedRef("main"), "HEAD")
+	runCommand(t, repository, binary, "group", "accept", "--name", "example", "--path", "example.txt")
+	var groups []session.Group
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("groups = %#v, want empty after stale group acceptance", groups)
+	}
+}
+
 func number(value int) string {
 	return fmt.Sprint(value)
 }

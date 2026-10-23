@@ -310,7 +310,7 @@ func acceptGroup(ctx context.Context, args []string) error {
 		return err
 	}
 	store := session.NewStore(repo.GitDir)
-	groups, err := store.LoadGroups(state.WorkBranch)
+	groups, removed, err := liveGroups(ctx, repo, state, store)
 	if err != nil {
 		return err
 	}
@@ -347,6 +347,9 @@ func acceptGroup(ctx context.Context, args []string) error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{"commit": commit})
 	}
+	if removed[*name] {
+		return json.NewEncoder(os.Stdout).Encode(map[string]string{"commit": ""})
+	}
 	return fmt.Errorf("review group %q does not exist", *name)
 }
 
@@ -363,7 +366,8 @@ func viewGroup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	groups, err := session.NewStore(repo.GitDir).LoadGroups(state.WorkBranch)
+	store := session.NewStore(repo.GitDir)
+	groups, _, err := liveGroups(ctx, repo, state, store)
 	if err != nil {
 		return err
 	}
@@ -442,11 +446,55 @@ func listGroups(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	groups, err := session.NewStore(repo.GitDir).LoadGroups(state.WorkBranch)
+	store := session.NewStore(repo.GitDir)
+	groups, _, err := liveGroups(ctx, repo, state, store)
 	if err != nil {
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(groups)
+}
+
+func liveGroups(ctx context.Context, repo repository.Repository, state session.State, store session.Store) ([]session.Group, map[string]bool, error) {
+	groups, err := store.LoadGroups(state.WorkBranch)
+	if err != nil {
+		return nil, nil, err
+	}
+	hunks, err := repo.DiffHunks(ctx, state.ReviewedRef, "HEAD")
+	if err != nil {
+		return nil, nil, err
+	}
+	live := make(map[session.Hunk]bool, len(hunks))
+	for _, hunk := range hunks {
+		live[hunk] = true
+	}
+	var retained []session.Group
+	removed := map[string]bool{}
+	changed := false
+	for _, group := range groups {
+		var groupHunks []session.Hunk
+		for _, hunk := range group.Hunks {
+			if live[hunk] {
+				groupHunks = append(groupHunks, hunk)
+			} else {
+				changed = true
+			}
+		}
+		if len(groupHunks) == 0 {
+			if len(group.Hunks) != 0 {
+				removed[group.Name] = true
+			}
+			changed = true
+			continue
+		}
+		group.Hunks = groupHunks
+		retained = append(retained, group)
+	}
+	if changed {
+		if err := store.SaveGroups(state.WorkBranch, retained); err != nil {
+			return nil, nil, err
+		}
+	}
+	return retained, removed, nil
 }
 
 func containsHunk(hunks []session.Hunk, candidate session.Hunk) bool {
