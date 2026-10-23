@@ -9,8 +9,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/cyp/git-review/internal/repository"
-	"github.com/cyp/git-review/internal/session"
+	"github.com/CypDasHuhn/git-review/internal/repository"
+	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
 func main() {

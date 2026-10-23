@@ -1,3 +1,3 @@
-module github.com/cyp/git-review
+module github.com/CypDasHuhn/git-review
 
 go 1.26

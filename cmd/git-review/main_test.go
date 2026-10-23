@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cyp/git-review/internal/session"
+	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
 func TestInitCreatesReviewSession(t *testing.T) {
