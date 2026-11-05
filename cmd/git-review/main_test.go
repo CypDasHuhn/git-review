@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/CypDasHuhn/git-review/internal/session"
@@ -21,6 +22,10 @@ func TestInitCreatesReviewSession(t *testing.T) {
 	}
 	runCommand(t, repository, "git", "add", "README.md")
 	runCommand(t, repository, "git", "commit", "-m", "initial")
+	hookPath := filepath.Join(repository, ".git", "hooks", "post-merge")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\necho existing\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	binary := filepath.Join(t.TempDir(), "git-review")
 	runCommand(t, projectRoot(t), "go", "build", "-o", binary, ".")
@@ -42,6 +47,80 @@ func TestInitCreatesReviewSession(t *testing.T) {
 	}
 	if value := runCommand(t, repository, "git", "config", "--local", "rerere.enabled"); value != "true\n" {
 		t.Fatalf("rerere.enabled = %q, want true", value)
+	}
+	hook, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content := string(hook); !strings.Contains(content, "echo existing") || strings.Count(content, "sync-base --hook") != 1 {
+		t.Fatalf("post-merge hook = %q", content)
+	}
+}
+
+func TestSyncBaseMergesCurrentComparisonIntoReviewedState(t *testing.T) {
+	repository := t.TempDir()
+	runCommand(t, repository, "git", "init", "--initial-branch=main")
+	runCommand(t, repository, "git", "config", "user.email", "test@example.com")
+	runCommand(t, repository, "git", "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repository, "base.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "base.txt")
+	runCommand(t, repository, "git", "commit", "-m", "initial")
+	runCommand(t, repository, "git", "checkout", "-b", "develop")
+	runCommand(t, repository, "git", "checkout", "-b", "feature")
+
+	binary := filepath.Join(t.TempDir(), "git-review")
+	runCommand(t, projectRoot(t), "go", "build", "-o", binary, ".")
+	runCommand(t, repository, binary, "init", "--base", "develop")
+
+	if err := os.WriteFile(filepath.Join(repository, "accepted.txt"), []byte("accepted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "unaccepted.txt"), []byte("unaccepted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "accepted.txt", "unaccepted.txt")
+	runCommand(t, repository, "git", "commit", "-m", "feature changes")
+	runCommand(t, repository, binary, "accept", "--path", "accepted.txt")
+
+	runCommand(t, repository, "git", "checkout", "develop")
+	if err := os.WriteFile(filepath.Join(repository, "develop.txt"), []byte("develop\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "develop.txt")
+	runCommand(t, repository, "git", "commit", "-m", "develop changes")
+	developCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, "git", "checkout", "feature")
+	runCommand(t, repository, "git", "merge", "--no-edit", "develop")
+
+	rawStatus := runCommand(t, repository, binary, "status", "--json")
+	var status session.Status
+	if err := json.Unmarshal([]byte(rawStatus), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.PinnedComparisonCommit != developCommit {
+		t.Fatalf("pinned comparison commit = %q, want %q", status.PinnedComparisonCommit, developCommit)
+	}
+	if status.ComparisonBaseAdvanced {
+		t.Fatal("comparison base is still advanced")
+	}
+
+	reviewed := session.ReviewedRef("feature")
+	parents := strings.Fields(runCommand(t, repository, "git", "show", "-s", "--format=%P", reviewed))
+	if len(parents) != 2 {
+		t.Fatalf("reviewed state has %d parents, want 2", len(parents))
+	}
+	if content := runCommand(t, repository, "git", "show", reviewed+":develop.txt"); content != "develop\n" {
+		t.Fatalf("reviewed state develop content = %q", content)
+	}
+
+	var hunks []session.Hunk
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "changes", "--json")), &hunks); err != nil {
+		t.Fatal(err)
+	}
+	if len(hunks) != 1 || hunks[0].Path != "unaccepted.txt" {
+		t.Fatalf("changes = %#v, want the unaccepted feature hunk", hunks)
 	}
 }
 

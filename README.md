@@ -8,10 +8,13 @@ The work branch remains editable. The reviewed state records only explicitly acc
 
 ```text
 git-review init [--base <ref>]
+git-review sync-base
 git-review status [--json]
 ```
 
 `init` enables Git rerere in the current repository, creates the reviewed-state ref, and stores review-session metadata under `.git/git-review`.
+
+`sync-base` merges the current comparison ref into the reviewed state when the work branch already contains that ref, then advances the session's pinned base. `init` installs a post-merge hook that performs this synchronization automatically after the comparison ref is merged into the work branch.
 
 ## Development
 

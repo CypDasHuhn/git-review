@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -62,12 +63,76 @@ func (r Repository) EnableRerere(ctx context.Context) error {
 	return nil
 }
 
+func (r Repository) InstallPostMergeHook() error {
+	hooksDirectory := filepath.Join(r.GitDir, "hooks")
+	hookPath := filepath.Join(hooksDirectory, "post-merge")
+	const hookCommand = "sync-base --hook || true"
+	contents, err := os.ReadFile(hookPath)
+	if errors.Is(err, os.ErrNotExist) {
+		contents = []byte("#!/bin/sh\n")
+	} else if err != nil {
+		return fmt.Errorf("read post-merge hook: %w", err)
+	}
+	if strings.Contains(string(contents), hookCommand) {
+		return nil
+	}
+	if len(contents) > 0 && contents[len(contents)-1] != '\n' {
+		contents = append(contents, '\n')
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate git-review executable: %w", err)
+	}
+	contents = append(contents, []byte(shellQuote(executable)+" "+hookCommand+"\n")...)
+	if err := os.WriteFile(hookPath, contents, 0o755); err != nil {
+		return fmt.Errorf("write post-merge hook: %w", err)
+	}
+	if err := os.Chmod(hookPath, 0o755); err != nil {
+		return fmt.Errorf("make post-merge hook executable: %w", err)
+	}
+	return nil
+}
+
 func (r Repository) CreateRef(ctx context.Context, ref string, commit string) error {
 	_, err := git(ctx, r.Root, "update-ref", ref, commit)
 	if err != nil {
 		return fmt.Errorf("create reviewed state %q: %w", ref, err)
 	}
 	return nil
+}
+
+func (r Repository) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	command := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", ancestor, descendant)
+	command.Dir = r.Root
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %s", ancestor, descendant, strings.TrimSpace(string(output)))
+}
+
+func (r Repository) MergeRef(ctx context.Context, ref, other, subject string) (string, error) {
+	head, err := r.ResolveCommit(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	treeOutput, err := git(ctx, r.Root, "merge-tree", "--write-tree", "--messages", head, other)
+	if err != nil {
+		return "", fmt.Errorf("merge %s into %s: %w", other, ref, err)
+	}
+	tree := strings.SplitN(treeOutput, "\n", 2)[0]
+	commit, err := git(ctx, r.Root, "commit-tree", tree, "-p", head, "-p", other, "-m", subject)
+	if err != nil {
+		return "", fmt.Errorf("create merge commit for %s: %w", ref, err)
+	}
+	if _, err := git(ctx, r.Root, "update-ref", ref, commit, head); err != nil {
+		return "", err
+	}
+	return commit, nil
 }
 
 func (r Repository) AcceptPaths(ctx context.Context, ref string, paths []string, subject string) (bool, error) {
@@ -372,4 +437,8 @@ func gitWithInput(ctx context.Context, directory string, env map[string]string, 
 
 func PathInRepository(root string, elements ...string) string {
 	return filepath.Join(append([]string{root}, elements...)...)
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

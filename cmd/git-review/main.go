@@ -28,6 +28,8 @@ func run(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "init":
 		return initialize(ctx, args[1:])
+	case "sync-base":
+		return syncBase(ctx, args[1:])
 	case "status":
 		return showStatus(ctx, args[1:])
 	case "accept":
@@ -92,6 +94,9 @@ func initialize(ctx context.Context, args []string) error {
 	if err := repo.EnableRerere(ctx); err != nil {
 		return err
 	}
+	if err := repo.InstallPostMergeHook(); err != nil {
+		return err
+	}
 	if err := repo.CreateRef(ctx, reviewedRef, comparisonCommit); err != nil {
 		return err
 	}
@@ -112,6 +117,89 @@ func initialize(ctx context.Context, args []string) error {
 	}
 
 	fmt.Printf("Started review for %s against %s at %s\n", workBranch, comparisonRef, comparisonCommit)
+	return nil
+}
+
+func syncBase(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("sync-base", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	hook := flags.Bool("hook", false, "run from the post-merge hook")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("sync-base does not accept positional arguments")
+	}
+	repo, state, err := currentSession(ctx)
+	if err != nil {
+		if *hook && errors.Is(err, session.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if err := repo.InstallPostMergeHook(); err != nil {
+		if *hook {
+			fmt.Fprintln(os.Stderr, "git-review:", err)
+			return nil
+		}
+		return err
+	}
+	currentComparison, err := repo.ResolveCommit(ctx, state.ComparisonRef)
+	if err != nil {
+		if *hook {
+			fmt.Fprintln(os.Stderr, "git-review:", err)
+			return nil
+		}
+		return fmt.Errorf("resolve comparison base: %w", err)
+	}
+	if currentComparison == state.PinnedComparisonCommit {
+		if !*hook {
+			fmt.Println("Review base is already synchronized")
+		}
+		return nil
+	}
+	contained, err := repo.IsAncestor(ctx, currentComparison, "HEAD")
+	if err != nil {
+		if *hook {
+			fmt.Fprintln(os.Stderr, "git-review:", err)
+			return nil
+		}
+		return err
+	}
+	if !contained {
+		if *hook {
+			return nil
+		}
+		return fmt.Errorf("comparison base %s is not contained in the work branch; merge %s into the work branch first", currentComparison, state.ComparisonRef)
+	}
+	reviewedContainsBase, err := repo.IsAncestor(ctx, currentComparison, state.ReviewedRef)
+	if err != nil {
+		if *hook {
+			fmt.Fprintln(os.Stderr, "git-review:", err)
+			return nil
+		}
+		return err
+	}
+	if !reviewedContainsBase {
+		if _, err := repo.MergeRef(ctx, state.ReviewedRef, currentComparison, "merge review base: "+state.ComparisonRef); err != nil {
+			if *hook {
+				fmt.Fprintln(os.Stderr, "git-review:", err)
+				return nil
+			}
+			return err
+		}
+	}
+	state.PinnedComparisonCommit = currentComparison
+	if err := session.NewStore(repo.GitDir).Save(state); err != nil {
+		if *hook {
+			fmt.Fprintln(os.Stderr, "git-review:", err)
+			return nil
+		}
+		return err
+	}
+	if !*hook {
+		fmt.Printf("Synchronized review base to %s\n", currentComparison)
+	}
 	return nil
 }
 
@@ -517,7 +605,7 @@ func currentSession(ctx context.Context) (repository.Repository, session.State, 
 	}
 	state, err := session.NewStore(repo.GitDir).Load(workBranch)
 	if errors.Is(err, session.ErrNotFound) {
-		return repository.Repository{}, session.State{}, fmt.Errorf("no review session exists for %q", workBranch)
+		return repository.Repository{}, session.State{}, fmt.Errorf("no review session exists for %q: %w", workBranch, session.ErrNotFound)
 	}
 	return repo, state, err
 }
@@ -536,16 +624,17 @@ func (s *stringList) Set(value string) error {
 func usage() error {
 	_, err := fmt.Fprint(os.Stderr, strings.TrimSpace(`Usage:
   git-review init [--base <ref>]
+  git-review sync-base
   git-review status [--json]
-	git-review accept --path <path> [--path <path>...] [--subject <summary>]
-	git-review undo
-	git-review history
-	git-review reset --commit <commit>
-	git-review changes --json
-	git-review group list --json
-	git-review group assign --name <name> --path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>
-	git-review group view --name <name>
-	git-review group accept --name <name> --path <path>
+  git-review accept --path <path> [--path <path>...] [--subject <summary>]
+  git-review undo
+  git-review history
+  git-review reset --commit <commit>
+  git-review changes --json
+  git-review group list --json
+  git-review group assign --name <name> --path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>
+  git-review group view --name <name>
+  git-review group accept --name <name> --path <path>
 `)+"\n")
 	return err
 }
