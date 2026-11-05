@@ -10,11 +10,17 @@ The work branch remains editable. The reviewed state records only explicitly acc
 git-review init [--base <ref>]
 git-review sync-base
 git-review status [--json]
+git-review group add --name <name> --commit <commit>
+git-review group list --json
+git-review group view --name <name>
+git-review group accept --name <name> --path <path>
 ```
 
 `init` enables Git rerere in the current repository, creates the reviewed-state ref, and stores review-session metadata under `.git/git-review`.
 
 `sync-base` merges the current comparison ref into the reviewed state when the work branch already contains that ref, then advances the session's pinned base. `init` installs a post-merge hook that performs this synchronization automatically after the comparison ref is merged into the work branch.
+
+`group add` accepts either a full or abbreviated commit hash and adds the commit's current changes to a review group. Group metadata retains both forms of the resolved hash.
 
 ## Development
 

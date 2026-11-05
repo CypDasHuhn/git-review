@@ -55,6 +55,26 @@ func (r Repository) ResolveCommit(ctx context.Context, ref string) (string, erro
 	return commit, nil
 }
 
+func (r Repository) CommitInfo(ctx context.Context, ref string) (session.Commit, error) {
+	commit, err := r.ResolveCommit(ctx, ref)
+	if err != nil {
+		return session.Commit{}, err
+	}
+	shortCommit, err := git(ctx, r.Root, "rev-parse", "--short", commit)
+	if err != nil {
+		return session.Commit{}, err
+	}
+	return session.Commit{Hash: commit, ShortHash: shortCommit}, nil
+}
+
+func (r Repository) CommitHunks(ctx context.Context, commit string) ([]session.Hunk, error) {
+	parent, err := git(ctx, r.Root, "rev-parse", commit+"^")
+	if err != nil {
+		parent = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	}
+	return r.DiffHunks(ctx, parent, commit)
+}
+
 func (r Repository) EnableRerere(ctx context.Context) error {
 	_, err := git(ctx, r.Root, "config", "--local", "rerere.enabled", "true")
 	if err != nil {

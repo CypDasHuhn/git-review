@@ -42,9 +42,15 @@ type Hunk struct {
 	NewLines int    `json:"newLines"`
 }
 
+type Commit struct {
+	Hash      string `json:"hash"`
+	ShortHash string `json:"shortHash"`
+}
+
 type Group struct {
-	Name  string `json:"name"`
-	Hunks []Hunk `json:"hunks"`
+	Name    string   `json:"name"`
+	Hunks   []Hunk   `json:"hunks"`
+	Commits []Commit `json:"commits,omitempty"`
 }
 
 func NewStore(gitDir string) Store {

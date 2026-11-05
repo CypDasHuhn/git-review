@@ -183,6 +183,70 @@ func TestChangesAndGroupsTrackCurrentHunks(t *testing.T) {
 	}
 }
 
+func TestGroupAddCommitAcceptsLongAndShortHashes(t *testing.T) {
+	repository := t.TempDir()
+	runCommand(t, repository, "git", "init", "--initial-branch=main")
+	runCommand(t, repository, "git", "config", "user.email", "test@example.com")
+	runCommand(t, repository, "git", "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repository, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "base.txt")
+	runCommand(t, repository, "git", "commit", "-m", "initial")
+
+	binary := filepath.Join(t.TempDir(), "git-review")
+	runCommand(t, projectRoot(t), "go", "build", "-o", binary, ".")
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(repository, "first.txt"), []byte("first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "first.txt")
+	runCommand(t, repository, "git", "commit", "-m", "first change")
+	firstCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+
+	if err := os.WriteFile(filepath.Join(repository, "second.txt"), []byte("second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "second.txt")
+	runCommand(t, repository, "git", "commit", "-m", "second change")
+	secondCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	secondShortCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "--short", secondCommit))
+
+	runCommand(t, repository, binary, "group", "add", "--name", "changes", "--commit", firstCommit)
+	runCommand(t, repository, binary, "group", "assign", "--name", "changes", "--commit", secondShortCommit)
+
+	var groups []session.Group
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || groups[0].Name != "changes" || len(groups[0].Hunks) != 2 || len(groups[0].Commits) != 2 {
+		t.Fatalf("groups = %#v, want both commits and their hunks", groups)
+	}
+	if groups[0].Commits[0].Hash != firstCommit {
+		t.Fatalf("first commit hash = %q, want %q", groups[0].Commits[0].Hash, firstCommit)
+	}
+	if groups[0].Commits[1].Hash != secondCommit {
+		t.Fatalf("second commit hash = %q, want %q", groups[0].Commits[1].Hash, secondCommit)
+	}
+	for _, commit := range groups[0].Commits {
+		if len(commit.Hash) != 40 || !strings.HasPrefix(commit.Hash, commit.ShortHash) {
+			t.Fatalf("commit hashes = %#v, want full and abbreviated hashes", commit)
+		}
+	}
+
+	var projection map[string]string
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "view", "--name", "changes")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if content := runCommand(t, repository, "git", "show", projection["commit"]+":first.txt"); content != "first\n" {
+		t.Fatalf("projected first file = %q", content)
+	}
+	if content := runCommand(t, repository, "git", "show", projection["commit"]+":second.txt"); content != "second\n" {
+		t.Fatalf("projected second file = %q", content)
+	}
+}
+
 func TestGroupsPruneAcceptedHunks(t *testing.T) {
 	repository := t.TempDir()
 	runCommand(t, repository, "git", "init", "--initial-branch=main")

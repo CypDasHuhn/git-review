@@ -372,6 +372,8 @@ func group(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "assign":
 		return assignGroup(ctx, args[1:])
+	case "add":
+		return addGroupCommit(ctx, args[1:])
 	case "list":
 		return listGroups(ctx, args[1:])
 	case "view":
@@ -477,6 +479,7 @@ func assignGroup(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("group assign", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	name := flags.String("name", "", "review group name")
+	commit := flags.String("commit", "", "commit hash")
 	path := flags.String("path", "", "changed file path")
 	oldStart := flags.Int("old-start", -1, "old hunk start")
 	oldLines := flags.Int("old-lines", -1, "old hunk line count")
@@ -484,6 +487,12 @@ func assignGroup(ctx context.Context, args []string) error {
 	newLines := flags.Int("new-lines", -1, "new hunk line count")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *commit != "" {
+		if flags.NArg() != 0 || *name == "" || *path != "" || *oldStart >= 0 || *oldLines >= 0 || *newStart >= 0 || *newLines >= 0 {
+			return errors.New("group assign with --commit requires --name and --commit only")
+		}
+		return addGroupCommitValues(ctx, *name, *commit)
 	}
 	if flags.NArg() != 0 || *name == "" || *path == "" || *oldStart < 0 || *oldLines < 0 || *newStart < 0 || *newLines < 0 {
 		return errors.New("group assign requires --name, --path, --old-start, --old-lines, --new-start, and --new-lines")
@@ -515,6 +524,99 @@ func assignGroup(ctx context.Context, args []string) error {
 		}
 	}
 	return store.SaveGroups(state.WorkBranch, append(groups, session.Group{Name: *name, Hunks: []session.Hunk{hunk}}))
+}
+
+func addGroupCommit(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("group add", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	name := flags.String("name", "", "review group name")
+	commit := flags.String("commit", "", "commit hash")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	positional := flags.NArg()
+	if *commit == "" && positional == 1 {
+		*commit = flags.Arg(0)
+		positional = 0
+	}
+	if positional != 0 || *name == "" || *commit == "" {
+		return errors.New("group add requires --name and --commit")
+	}
+	return addGroupCommitValues(ctx, *name, *commit)
+}
+
+func addGroupCommitValues(ctx context.Context, name, ref string) error {
+	repo, state, err := currentSession(ctx)
+	if err != nil {
+		return err
+	}
+	commit, err := repo.CommitInfo(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("resolve commit %q: %w", ref, err)
+	}
+	store := session.NewStore(repo.GitDir)
+	groups, err := store.LoadGroups(state.WorkBranch)
+	if err != nil {
+		return err
+	}
+	for index := range groups {
+		if groups[index].Name != name {
+			continue
+		}
+		if containsCommit(groups[index].Commits, commit) {
+			return printAddedCommit(commit)
+		}
+		if err := addCommitHunks(ctx, repo, state, &groups[index], commit); err != nil {
+			return err
+		}
+		groups[index].Commits = append(groups[index].Commits, commit)
+		if err := store.SaveGroups(state.WorkBranch, groups); err != nil {
+			return err
+		}
+		return printAddedCommit(commit)
+	}
+
+	group := session.Group{Name: name, Commits: []session.Commit{commit}}
+	if err := addCommitHunks(ctx, repo, state, &group, commit); err != nil {
+		return err
+	}
+	if err := store.SaveGroups(state.WorkBranch, append(groups, group)); err != nil {
+		return err
+	}
+	return printAddedCommit(commit)
+}
+
+func addCommitHunks(ctx context.Context, repo repository.Repository, state session.State, group *session.Group, commit session.Commit) error {
+	commitHunks, err := repo.CommitHunks(ctx, commit.Hash)
+	if err != nil {
+		return fmt.Errorf("find changes for commit %s: %w", commit.ShortHash, err)
+	}
+	currentHunks, err := repo.DiffHunks(ctx, state.ReviewedRef, "HEAD")
+	if err != nil {
+		return err
+	}
+	matched := false
+	for _, candidate := range commitHunks {
+		hunk, found := matchingHunk(currentHunks, candidate)
+		if !found {
+			continue
+		}
+		matched = true
+		if !containsHunk(group.Hunks, hunk) {
+			group.Hunks = append(group.Hunks, hunk)
+		}
+	}
+	if !matched {
+		return fmt.Errorf("commit %s has no current review changes", commit.ShortHash)
+	}
+	return nil
+}
+
+func printAddedCommit(commit session.Commit) error {
+	return json.NewEncoder(os.Stdout).Encode(map[string]string{
+		"commit":      commit.Hash,
+		"shortCommit": commit.ShortHash,
+	})
 }
 
 func matchingHunk(hunks []session.Hunk, candidate session.Hunk) (session.Hunk, bool) {
@@ -594,6 +696,15 @@ func containsHunk(hunks []session.Hunk, candidate session.Hunk) bool {
 	return false
 }
 
+func containsCommit(commits []session.Commit, candidate session.Commit) bool {
+	for _, commit := range commits {
+		if commit.Hash == candidate.Hash {
+			return true
+		}
+	}
+	return false
+}
+
 func currentSession(ctx context.Context) (repository.Repository, session.State, error) {
 	repo, err := repository.Open(ctx, "")
 	if err != nil {
@@ -632,6 +743,7 @@ func usage() error {
   git-review reset --commit <commit>
   git-review changes --json
   git-review group list --json
+  git-review group add --name <name> --commit <commit>
   git-review group assign --name <name> --path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>
   git-review group view --name <name>
   git-review group accept --name <name> --path <path>
