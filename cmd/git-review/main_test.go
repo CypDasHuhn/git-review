@@ -12,6 +12,16 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
+func TestVersionFlags(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "git-review")
+	runCommand(t, projectRoot(t), "go", "build", "-o", binary, ".")
+	for _, flag := range []string{"--version", "-v"} {
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.2.5\n" {
+			t.Fatalf("%s output = %q, want git-review 0.2.5", flag, output)
+		}
+	}
+}
+
 func TestInitCreatesReviewSession(t *testing.T) {
 	repository := t.TempDir()
 	runCommand(t, repository, "git", "init", "--initial-branch=main")

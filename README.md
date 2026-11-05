@@ -7,6 +7,8 @@ The work branch remains editable. The reviewed state records only explicitly acc
 ## Commands
 
 ```text
+git-review --version
+git-review -v
 git-review init [--base <ref>]
 git-review sync-base
 git-review status [--json]
@@ -15,6 +17,8 @@ git-review group list --json
 git-review group view --name <name>
 git-review group accept --name <name> --path <path>
 ```
+
+`--version` and `-v` print the CLI version.
 
 `init` enables Git rerere in the current repository, creates the reviewed-state ref, and stores review-session metadata under `.git/git-review`.
 

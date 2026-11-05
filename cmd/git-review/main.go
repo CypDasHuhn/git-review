@@ -13,6 +13,8 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
+const version = "0.2.5"
+
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "git-review:", err)
@@ -26,6 +28,8 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	switch args[0] {
+	case "--version", "-v":
+		return showVersion(args[1:])
 	case "init":
 		return initialize(ctx, args[1:])
 	case "sync-base":
@@ -49,6 +53,14 @@ func run(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func showVersion(args []string) error {
+	if len(args) != 0 {
+		return errors.New("version does not accept arguments")
+	}
+	fmt.Printf("git-review %s\n", version)
+	return nil
 }
 
 func initialize(ctx context.Context, args []string) error {
@@ -734,6 +746,8 @@ func (s *stringList) Set(value string) error {
 
 func usage() error {
 	_, err := fmt.Fprint(os.Stderr, strings.TrimSpace(`Usage:
+  git-review --version
+  git-review -v
   git-review init [--base <ref>]
   git-review sync-base
   git-review status [--json]
