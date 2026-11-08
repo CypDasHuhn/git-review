@@ -100,7 +100,7 @@ func (r Repository) CommitFragments(ctx context.Context, commit string) ([]Fragm
 }
 
 func (r Repository) ReviewFragments(ctx context.Context, base, target string) ([]session.Fragment, error) {
-	commitsOutput, err := git(ctx, r.Root, "rev-list", "--reverse", "--first-parent", "--no-merges", base+".."+target)
+	commitsOutput, err := git(ctx, r.Root, "rev-list", "--reverse", "--no-merges", base+".."+target)
 	if err != nil {
 		return nil, err
 	}

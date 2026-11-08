@@ -15,8 +15,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.3\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.3", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.4\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.4", flag, output)
 		}
 	}
 }
@@ -149,6 +149,43 @@ func TestGroupAddCommitFromBeforeMergedReviewBase(t *testing.T) {
 	}
 	if len(groups) != 1 || len(groups[0].Fragments) != 1 || groups[0].Fragments[0].Path != "redispatch-api/defaults.txt" {
 		t.Fatalf("groups = %#v, want feature fragment assigned by commit and path", groups)
+	}
+}
+
+func TestReviewFragmentsIncludesMergedSideBranch(t *testing.T) {
+	repository := newRepository(t, map[string]string{"base.txt": "initial\n"})
+	runCommand(t, repository, "git", "checkout", "-b", "develop")
+	writeFile(t, repository, "develop.txt", "develop\n")
+	runCommand(t, repository, "git", "add", "develop.txt")
+	runCommand(t, repository, "git", "commit", "-m", "develop change")
+	runCommand(t, repository, "git", "checkout", "main")
+	runCommand(t, repository, "git", "checkout", "-b", "source-side")
+	writeFile(t, repository, "source-side.txt", "source\n")
+	runCommand(t, repository, "git", "add", "source-side.txt")
+	runCommand(t, repository, "git", "commit", "-m", "source-side change")
+	sourceCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, "git", "checkout", "develop")
+	runCommand(t, repository, "git", "checkout", "-b", "integration-side")
+	runCommand(t, repository, "git", "merge", "--no-edit", "--no-ff", "source-side")
+	writeFile(t, repository, "late-side.txt", "late\n")
+	runCommand(t, repository, "git", "add", "late-side.txt")
+	runCommand(t, repository, "git", "commit", "-m", "late-side change")
+	lateCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "develop")
+	changes := readChanges(t, repository, binary)
+	if len(changes) != 2 {
+		t.Fatalf("changes = %#v, want source-side and late-side fragments", changes)
+	}
+	fragmentBy(t, changes, sourceCommit, "source-side.txt")
+	fragmentBy(t, changes, lateCommit, "late-side.txt")
+	runCommand(t, repository, binary, "group", "add", "--name", "source-side", "--commit", sourceCommit)
+	var groups []groupStatus
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || len(groups[0].Fragments) != 1 || groups[0].Fragments[0].Path != "source-side.txt" {
+		t.Fatalf("groups = %#v, want merged side-branch fragment assigned by commit", groups)
 	}
 }
 
