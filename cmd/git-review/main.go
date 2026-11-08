@@ -14,7 +14,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.2"
+const version = "0.4.3"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -103,7 +103,7 @@ func initialize(ctx context.Context, args []string) error {
 	if err := repo.EnableRerere(ctx); err != nil {
 		return err
 	}
-	if err := repo.InstallPostMergeHook(); err != nil {
+	if err := repo.InstallPostMergeHook(ctx); err != nil {
 		return err
 	}
 	reviewedRef := session.ReviewedRef(workBranch)
@@ -146,7 +146,7 @@ func syncBase(ctx context.Context, args []string) error {
 		}
 		return err
 	}
-	if err := repo.InstallPostMergeHook(); err != nil {
+	if err := repo.InstallPostMergeHook(ctx); err != nil {
 		if *hook {
 			fmt.Fprintln(os.Stderr, "git-review:", err)
 			return nil

@@ -138,8 +138,17 @@ func (r Repository) EnableRerere(ctx context.Context) error {
 	return nil
 }
 
-func (r Repository) InstallPostMergeHook() error {
-	hooksDirectory := filepath.Join(r.GitDir, "hooks")
+func (r Repository) InstallPostMergeHook(ctx context.Context) error {
+	hooksDirectory, err := git(ctx, r.Root, "rev-parse", "--git-path", "hooks")
+	if err != nil {
+		return fmt.Errorf("locate Git hooks directory: %w", err)
+	}
+	if !filepath.IsAbs(hooksDirectory) {
+		hooksDirectory = filepath.Join(r.Root, hooksDirectory)
+	}
+	if err := os.MkdirAll(hooksDirectory, 0o755); err != nil {
+		return fmt.Errorf("create Git hooks directory: %w", err)
+	}
 	hookPath := filepath.Join(hooksDirectory, "post-merge")
 	const hookCommand = "sync-base --hook || true"
 	contents, err := os.ReadFile(hookPath)

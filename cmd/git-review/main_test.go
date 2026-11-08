@@ -15,8 +15,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.2\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.2", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.3\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.3", flag, output)
 		}
 	}
 }
@@ -70,6 +70,23 @@ func TestInitCreatesReviewSession(t *testing.T) {
 	}
 	if content := string(hook); !strings.Contains(content, "echo existing") || strings.Count(content, "sync-base --hook") != 1 {
 		t.Fatalf("post-merge hook = %q", content)
+	}
+}
+
+func TestInitInstallsHookInCommonDirectoryForWorktree(t *testing.T) {
+	repository := newRepository(t, map[string]string{"README.md": "initial\n"})
+	worktree := filepath.Join(t.TempDir(), "feature")
+	runCommand(t, repository, "git", "worktree", "add", "-b", "feature", worktree, "main")
+	defer runCommand(t, repository, "git", "worktree", "remove", "--force", worktree)
+	binary := buildBinary(t)
+	runCommand(t, worktree, binary, "init", "--base", "main")
+	hookPath := filepath.Join(repository, ".git", "hooks", "post-merge")
+	hook, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(hook), "sync-base --hook") != 1 {
+		t.Fatalf("post-merge hook = %q", hook)
 	}
 }
 
