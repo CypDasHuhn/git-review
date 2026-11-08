@@ -14,9 +14,17 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
+const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 type Repository struct {
 	Root   string
 	GitDir string
+}
+
+type FragmentPatch struct {
+	Fragment session.Fragment
+	OldLines []string
+	NewLines []string
 }
 
 func Open(ctx context.Context, directory string) (Repository, error) {
@@ -67,12 +75,59 @@ func (r Repository) CommitInfo(ctx context.Context, ref string) (session.Commit,
 	return session.Commit{Hash: commit, ShortHash: shortCommit}, nil
 }
 
-func (r Repository) CommitHunks(ctx context.Context, commit string) ([]session.Hunk, error) {
-	parent, err := git(ctx, r.Root, "rev-parse", commit+"^")
+func (r Repository) ParentCommit(ctx context.Context, commit string) (string, error) {
+	parent, err := git(ctx, r.Root, "rev-parse", commit+"^1")
 	if err != nil {
-		parent = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+		return emptyTree, nil
 	}
-	return r.DiffHunks(ctx, parent, commit)
+	return parent, nil
+}
+
+func (r Repository) CommitFragments(ctx context.Context, commit string) ([]FragmentPatch, error) {
+	parent, err := r.ParentCommit(ctx, commit)
+	if err != nil {
+		return nil, err
+	}
+	shortCommit, err := git(ctx, r.Root, "rev-parse", "--short", commit)
+	if err != nil {
+		return nil, err
+	}
+	output, err := git(ctx, r.Root, "diff", "--no-ext-diff", "--no-color", "--diff-algorithm=myers", "--unified=0", "-M", parent+".."+commit, "--")
+	if err != nil {
+		return nil, err
+	}
+	return parseFragmentPatches(output, commit, parent, shortCommit), nil
+}
+
+func (r Repository) ReviewFragments(ctx context.Context, base, target string) ([]session.Fragment, error) {
+	commitsOutput, err := git(ctx, r.Root, "rev-list", "--reverse", "--first-parent", "--no-merges", base+".."+target)
+	if err != nil {
+		return nil, err
+	}
+	var fragments []session.Fragment
+	for _, commit := range strings.Fields(commitsOutput) {
+		patches, err := r.CommitFragments(ctx, commit)
+		if err != nil {
+			return nil, err
+		}
+		for _, patch := range patches {
+			fragments = append(fragments, patch.Fragment)
+		}
+	}
+	return fragments, nil
+}
+
+func (r Repository) FragmentPatch(ctx context.Context, fragment session.Fragment) (FragmentPatch, error) {
+	patches, err := r.CommitFragments(ctx, fragment.Commit)
+	if err != nil {
+		return FragmentPatch{}, err
+	}
+	for _, patch := range patches {
+		if patch.Fragment.ID() == fragment.ID() {
+			return patch, nil
+		}
+	}
+	return FragmentPatch{}, fmt.Errorf("fragment %s no longer exists in commit %s", fragment.Label(), fragment.Commit)
 }
 
 func (r Repository) EnableRerere(ctx context.Context) error {
@@ -113,7 +168,7 @@ func (r Repository) InstallPostMergeHook() error {
 	return nil
 }
 
-func (r Repository) CreateRef(ctx context.Context, ref string, commit string) error {
+func (r Repository) CreateRef(ctx context.Context, ref, commit string) error {
 	_, err := git(ctx, r.Root, "update-ref", ref, commit)
 	if err != nil {
 		return fmt.Errorf("create reviewed state %q: %w", ref, err)
@@ -155,52 +210,6 @@ func (r Repository) MergeRef(ctx context.Context, ref, other, subject string) (s
 	return commit, nil
 }
 
-func (r Repository) AcceptPaths(ctx context.Context, ref string, paths []string, subject string) (bool, error) {
-	head, err := r.ResolveCommit(ctx, ref)
-	if err != nil {
-		return false, err
-	}
-	index, err := os.CreateTemp("", "git-review-index-*")
-	if err != nil {
-		return false, fmt.Errorf("create temporary index: %w", err)
-	}
-	indexPath := index.Name()
-	if err := index.Close(); err != nil {
-		return false, err
-	}
-	if err := os.Remove(indexPath); err != nil {
-		return false, err
-	}
-	defer os.Remove(indexPath)
-	env := map[string]string{"GIT_INDEX_FILE": indexPath}
-	if _, err := gitWithEnv(ctx, r.Root, env, "read-tree", head); err != nil {
-		return false, err
-	}
-	args := append([]string{"add", "-A", "--"}, paths...)
-	if _, err := gitWithEnv(ctx, r.Root, env, args...); err != nil {
-		return false, err
-	}
-	tree, err := gitWithEnv(ctx, r.Root, env, "write-tree")
-	if err != nil {
-		return false, err
-	}
-	headTree, err := git(ctx, r.Root, "rev-parse", head+"^{tree}")
-	if err != nil {
-		return false, err
-	}
-	if tree == headTree {
-		return false, nil
-	}
-	commit, err := git(ctx, r.Root, "commit-tree", tree, "-p", head, "-m", "accept: "+subject)
-	if err != nil {
-		return false, err
-	}
-	if _, err := git(ctx, r.Root, "update-ref", ref, commit, head); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 func (r Repository) UndoAcceptance(ctx context.Context, ref string) (bool, string, error) {
 	head, err := r.ResolveCommit(ctx, ref)
 	if err != nil {
@@ -210,7 +219,7 @@ func (r Repository) UndoAcceptance(ctx context.Context, ref string) (bool, strin
 	if err != nil {
 		return false, "", err
 	}
-	if !strings.HasPrefix(subject, "accept: ") {
+	if !strings.HasPrefix(subject, "accept ") && !strings.HasPrefix(subject, "accept:") {
 		return false, "nothing to un-accept", nil
 	}
 	parent, err := git(ctx, r.Root, "rev-parse", head+"^")
@@ -238,151 +247,353 @@ func (r Repository) Log(ctx context.Context, ref string) (string, error) {
 	return git(ctx, r.Root, "log", "--format=%H%x09%h%x09%cr%x09%s", ref)
 }
 
-func (r Repository) DiffHunks(ctx context.Context, base, target string) ([]session.Hunk, error) {
-	output, err := git(ctx, r.Root, "diff", "--no-ext-diff", "--unified=0", base+".."+target, "--")
-	if err != nil {
-		return nil, err
-	}
-	var hunks []session.Hunk
-	path := ""
-	oldPath := ""
-	for _, line := range strings.Split(output, "\n") {
-		if strings.HasPrefix(line, "diff --git ") {
-			path = ""
-			oldPath = ""
-			continue
-		}
-		if strings.HasPrefix(line, "+++ b/") {
-			path = strings.TrimPrefix(line, "+++ b/")
-			continue
-		}
-		if strings.HasPrefix(line, "--- a/") {
-			oldPath = strings.TrimPrefix(line, "--- a/")
-			if path == "" {
-				path = oldPath
-			}
-			continue
-		}
-		if !strings.HasPrefix(line, "@@ ") {
-			continue
-		}
-		oldStart, oldLines, newStart, newLines, ok := parseHunkHeader(line)
-		if !ok || path == "" {
-			continue
-		}
-		hunks = append(hunks, session.Hunk{
-			Path: path, OldPath: oldPath, OldStart: oldStart, OldLines: oldLines, NewStart: newStart, NewLines: newLines,
-		})
-	}
-	return hunks, nil
-}
-
-func (r Repository) CreateGroupProjection(ctx context.Context, base, target, ref, name string, hunks []session.Hunk) (string, error) {
-	patch, err := r.patchForHunks(ctx, base, target, hunks)
+func (r Repository) ApplyFragment(ctx context.Context, ref string, patch FragmentPatch) (string, error) {
+	head, err := r.ResolveCommit(ctx, ref)
 	if err != nil {
 		return "", err
 	}
-	if patch == "" {
-		return "", fmt.Errorf("review group %q has no current changes", name)
+	sourcePath := patch.Fragment.Path
+	if patch.Fragment.OldPath != "" {
+		sourcePath = patch.Fragment.OldPath
 	}
-	index, err := os.CreateTemp("", "git-review-index-*")
+	sourceData, sourceExists, err := r.treeFile(ctx, patch.Fragment.Parent, sourcePath)
 	if err != nil {
-		return "", fmt.Errorf("create temporary index: %w", err)
-	}
-	indexPath := index.Name()
-	if err := index.Close(); err != nil {
 		return "", err
 	}
-	if err := os.Remove(indexPath); err != nil {
+	currentPath := patch.Fragment.Path
+	currentData, currentExists, err := r.treeFile(ctx, head, currentPath)
+	if err != nil {
+		return "", err
+	}
+	if !currentExists && patch.Fragment.OldPath != "" && patch.Fragment.OldPath != patch.Fragment.Path {
+		currentData, currentExists, err = r.treeFile(ctx, head, patch.Fragment.OldPath)
+		if err != nil {
+			return "", err
+		}
+		currentPath = patch.Fragment.OldPath
+	}
+	sourceLines, _ := splitLines(sourceData)
+	currentLines, currentNewline := splitLines(currentData)
+	if !sourceExists {
+		sourceLines = nil
+	}
+	if !currentExists {
+		currentLines = nil
+		currentNewline = true
+	}
+	position, err := locateEdit(sourceLines, currentLines, patch.Fragment.OldStart, patch.Fragment.OldLines)
+	if err != nil {
+		return "", fmt.Errorf("locate fragment %s: %w", patch.Fragment.Label(), err)
+	}
+	if patch.Fragment.OldLines > 0 && position+patch.Fragment.OldLines > len(currentLines) {
+		return "", fmt.Errorf("fragment %s exceeds current file", patch.Fragment.Label())
+	}
+	updated := make([]string, 0, len(currentLines)-patch.Fragment.OldLines+len(patch.NewLines))
+	updated = append(updated, currentLines[:position]...)
+	updated = append(updated, patch.NewLines...)
+	updated = append(updated, currentLines[position+patch.Fragment.OldLines:]...)
+	trailingNewline := currentNewline
+	targetData, targetExists, err := r.treeFile(ctx, patch.Fragment.Commit, patch.Fragment.Path)
+	if err != nil {
+		return "", err
+	}
+	if targetExists {
+		targetLines, targetNewline := splitLines(targetData)
+		if patch.Fragment.NewLines > 0 && patch.Fragment.NewStart-1+patch.Fragment.NewLines >= len(targetLines) {
+			trailingNewline = targetNewline
+		}
+	}
+	indexPath, err := temporaryIndex()
+	if err != nil {
 		return "", err
 	}
 	defer os.Remove(indexPath)
 	env := map[string]string{"GIT_INDEX_FILE": indexPath}
-	if _, err := gitWithEnv(ctx, r.Root, env, "read-tree", base); err != nil {
+	if _, err := gitWithEnv(ctx, r.Root, env, "read-tree", head); err != nil {
 		return "", err
 	}
-	if _, err := gitWithInput(ctx, r.Root, env, patch, "apply", "--cached", "--unidiff-zero"); err != nil {
-		return "", err
+	if patch.Fragment.OldPath != "" && patch.Fragment.OldPath != patch.Fragment.Path {
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", patch.Fragment.OldPath); err != nil {
+			return "", err
+		}
 	}
-	for _, hunk := range hunks {
-		if hunk.OldPath != "" && hunk.OldPath != hunk.Path {
-			if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", hunk.OldPath); err != nil {
+	if !targetExists {
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", patch.Fragment.Path); err != nil {
+			return "", err
+		}
+	} else {
+		data := joinLines(updated, trailingNewline)
+		blob, err := gitWithInput(ctx, r.Root, env, data, "hash-object", "-w", "--stdin")
+		if err != nil {
+			return "", err
+		}
+		mode, err := r.fileMode(ctx, patch.Fragment.Commit, patch.Fragment.Path)
+		if err != nil {
+			mode, err = r.fileMode(ctx, head, currentPath)
+			if err != nil {
 				return "", err
 			}
+		}
+		cacheInfo := mode + "," + blob + "," + patch.Fragment.Path
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--add", "--cacheinfo", cacheInfo); err != nil {
+			return "", err
 		}
 	}
 	tree, err := gitWithEnv(ctx, r.Root, env, "write-tree")
 	if err != nil {
 		return "", err
 	}
-	commit, err := git(ctx, r.Root, "commit-tree", tree, "-p", base, "-m", "review group: "+name)
+	commit, err := git(ctx, r.Root, "commit-tree", tree, "-p", head, "-m", "accept "+patch.Fragment.Label())
 	if err != nil {
 		return "", err
 	}
-	if _, err := git(ctx, r.Root, "update-ref", ref, commit); err != nil {
+	if _, err := git(ctx, r.Root, "update-ref", ref, commit, head); err != nil {
 		return "", err
 	}
 	return commit, nil
 }
 
-func (r Repository) patchForHunks(ctx context.Context, base, target string, selected []session.Hunk) (string, error) {
-	output, err := git(ctx, r.Root, "diff", "--no-ext-diff", "--unified=0", base+".."+target, "--")
+func (r Repository) treeFile(ctx context.Context, ref, path string) ([]byte, bool, error) {
+	if ref == "" {
+		return nil, false, nil
+	}
+	data, err := gitRaw(ctx, r.Root, "show", ref+":"+path)
+	if err != nil {
+		return nil, false, nil
+	}
+	return data, true, nil
+}
+
+func (r Repository) fileMode(ctx context.Context, ref, path string) (string, error) {
+	output, err := git(ctx, r.Root, "ls-tree", ref, "--", path)
 	if err != nil {
 		return "", err
 	}
-	wanted := map[session.Hunk]bool{}
-	for _, hunk := range selected {
-		wanted[hunk] = true
+	fields := strings.Fields(output)
+	if len(fields) < 1 {
+		return "", fmt.Errorf("file %q does not exist in %s", path, ref)
 	}
-	var result, prefix, hunk []string
+	return fields[0], nil
+}
+
+func parseFragmentPatches(output, commit, parent, shortCommit string) []FragmentPatch {
+	var patches []FragmentPatch
 	path := ""
 	oldPath := ""
-	addedPrefix := false
+	header := ""
+	var lines []string
 	flush := func() {
-		if len(hunk) == 0 {
+		if header == "" || path == "" {
 			return
 		}
-		oldStart, oldLines, newStart, newLines, ok := parseHunkHeader(hunk[0])
-		if ok && wanted[session.Hunk{Path: path, OldPath: oldPath, OldStart: oldStart, OldLines: oldLines, NewStart: newStart, NewLines: newLines}] {
-			if !addedPrefix {
-				result = append(result, prefix...)
-				addedPrefix = true
-			}
-			result = append(result, hunk...)
+		oldStart, oldLines, newStart, newLines, ok := parseHunkHeader(header)
+		if !ok {
+			header = ""
+			lines = nil
+			return
 		}
-		hunk = nil
+		var oldContent, newContent []string
+		for _, line := range lines {
+			if line == "\\ No newline at end of file" || line == "" {
+				continue
+			}
+			switch line[0] {
+			case '-':
+				oldContent = append(oldContent, line[1:])
+			case '+':
+				newContent = append(newContent, line[1:])
+			}
+		}
+		patches = append(patches, FragmentPatch{
+			Fragment: session.Fragment{
+				Commit: commit, ShortCommit: shortCommit, Parent: parent, Path: path, OldPath: oldPath,
+				OldStart: oldStart, OldLines: oldLines, NewStart: newStart, NewLines: newLines,
+			},
+			OldLines: oldContent,
+			NewLines: newContent,
+		})
+		header = ""
+		lines = nil
 	}
 	for _, line := range strings.Split(output, "\n") {
 		if strings.HasPrefix(line, "diff --git ") {
 			flush()
-			prefix = []string{line}
 			path = ""
 			oldPath = ""
-			addedPrefix = false
 			continue
 		}
 		if strings.HasPrefix(line, "@@ ") {
 			flush()
-			hunk = []string{line}
+			header = line
 			continue
 		}
-		if len(hunk) > 0 {
-			hunk = append(hunk, line)
+		if header != "" {
+			lines = append(lines, line)
 			continue
 		}
-		prefix = append(prefix, line)
-		if strings.HasPrefix(line, "+++ b/") {
-			path = strings.TrimPrefix(line, "+++ b/")
-		}
-		if strings.HasPrefix(line, "--- a/") {
-			oldPath = strings.TrimPrefix(line, "--- a/")
-			if path == "" {
+		if strings.HasPrefix(line, "--- ") {
+			oldPath = diffPath(line[4:], "a/")
+			if oldPath != "" && path == "" {
 				path = oldPath
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			newPath := diffPath(line[4:], "b/")
+			if newPath == "" {
+				path = oldPath
+			} else {
+				path = newPath
 			}
 		}
 	}
 	flush()
-	return strings.Join(result, "\n") + "\n", nil
+	return patches
+}
+
+func diffPath(value, prefix string) string {
+	value = strings.TrimSpace(value)
+	if value == "/dev/null" {
+		return ""
+	}
+	return strings.TrimPrefix(value, prefix)
+}
+
+func splitLines(data []byte) ([]string, bool) {
+	if len(data) == 0 {
+		return nil, false
+	}
+	trailingNewline := data[len(data)-1] == '\n'
+	text := string(data)
+	if trailingNewline {
+		text = text[:len(text)-1]
+	}
+	if text == "" {
+		return []string{}, trailingNewline
+	}
+	return strings.Split(text, "\n"), trailingNewline
+}
+
+func joinLines(lines []string, trailingNewline bool) []byte {
+	text := strings.Join(lines, "\n")
+	if trailingNewline {
+		text += "\n"
+	}
+	return []byte(text)
+}
+
+func locateEdit(source, current []string, start, count int) (int, error) {
+	position := start - 1
+	if count == 0 {
+		position = start
+	}
+	if position < 0 || position > len(source) || position+count > len(source) {
+		return 0, errors.New("source range is invalid")
+	}
+	if sameLines(source, current) {
+		return position, nil
+	}
+	old := source[position : position+count]
+	if count > 0 {
+		candidates := sequencePositions(current, old)
+		if len(candidates) == 1 {
+			return candidates[0], nil
+		}
+		for size := 3; size > 0; size-- {
+			before := source[max(0, position-size):position]
+			after := source[position+count : min(len(source), position+count+size)]
+			filtered := filterPositions(current, candidates, len(old), before, after)
+			if len(filtered) == 1 {
+				return filtered[0], nil
+			}
+		}
+		if len(candidates) == 0 {
+			return 0, errors.New("source lines are not present in the reviewed state")
+		}
+		return 0, errors.New("source lines are ambiguous in the reviewed state")
+	}
+	for size := 3; size > 0; size-- {
+		before := source[max(0, position-size):position]
+		after := source[position:min(len(source), position+size)]
+		candidates := boundaryPositions(current, before, after)
+		if len(candidates) == 1 {
+			return candidates[0], nil
+		}
+	}
+	return 0, errors.New("insertion anchors are ambiguous or missing in the reviewed state")
+}
+
+func sequencePositions(lines, sequence []string) []int {
+	if len(sequence) == 0 {
+		return nil
+	}
+	var positions []int
+	for start := 0; start+len(sequence) <= len(lines); start++ {
+		if sameLines(lines[start:start+len(sequence)], sequence) {
+			positions = append(positions, start)
+		}
+	}
+	return positions
+}
+
+func boundaryPositions(lines, before, after []string) []int {
+	var positions []int
+	for position := 0; position <= len(lines); position++ {
+		if len(before) > position || len(after) > len(lines)-position {
+			continue
+		}
+		if !sameLines(lines[position-len(before):position], before) {
+			continue
+		}
+		if !sameLines(lines[position:position+len(after)], after) {
+			continue
+		}
+		positions = append(positions, position)
+	}
+	return positions
+}
+
+func filterPositions(lines []string, positions []int, length int, before, after []string) []int {
+	var filtered []int
+	for _, position := range positions {
+		if len(before) > position || len(after) > len(lines)-position-length {
+			continue
+		}
+		if !sameLines(lines[position-len(before):position], before) {
+			continue
+		}
+		if !sameLines(lines[position+length:position+length+len(after)], after) {
+			continue
+		}
+		filtered = append(filtered, position)
+	}
+	return filtered
+}
+
+func sameLines(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func max(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func min(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 var hunkHeader = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
@@ -418,45 +629,72 @@ func parseHunkHeader(header string) (int, int, int, int, bool) {
 	return oldStart, oldLines, newStart, newLines, true
 }
 
-func git(ctx context.Context, directory string, args ...string) (string, error) {
-	return gitWithEnv(ctx, directory, nil, args...)
+func temporaryIndex() (string, error) {
+	index, err := os.CreateTemp("", "git-review-index-*")
+	if err != nil {
+		return "", fmt.Errorf("create temporary index: %w", err)
+	}
+	path := index.Name()
+	if err := index.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Remove(path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
-func gitWithEnv(ctx context.Context, directory string, env map[string]string, args ...string) (string, error) {
+func git(ctx context.Context, directory string, args ...string) (string, error) {
+	output, err := gitRaw(ctx, directory, args...)
+	return strings.TrimSpace(string(output)), err
+}
+
+func gitRaw(ctx context.Context, directory string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "git", args...)
 	if directory != "" {
 		command.Dir = directory
 	}
-	if len(env) > 0 {
-		command.Env = os.Environ()
-		for key, value := range env {
-			command.Env = append(command.Env, key+"="+value)
-		}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("git %s: %s", strings.Join(args, " "), strings.TrimSpace(string(output)))
+	}
+	return output, nil
+}
+
+func gitWithEnv(ctx context.Context, directory string, env map[string]string, args ...string) (string, error) {
+	output, err := gitWithEnvRaw(ctx, directory, env, args...)
+	return strings.TrimSpace(string(output)), err
+}
+
+func gitWithEnvRaw(ctx context.Context, directory string, env map[string]string, args ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, "git", args...)
+	if directory != "" {
+		command.Dir = directory
+	}
+	command.Env = os.Environ()
+	for key, value := range env {
+		command.Env = append(command.Env, key+"="+value)
 	}
 	output, err := command.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), strings.TrimSpace(string(output)))
+		return nil, fmt.Errorf("git %s: %s", strings.Join(args, " "), strings.TrimSpace(string(output)))
 	}
-	return strings.TrimSpace(string(output)), nil
+	return output, nil
 }
 
-func gitWithInput(ctx context.Context, directory string, env map[string]string, input string, args ...string) (string, error) {
+func gitWithInput(ctx context.Context, directory string, env map[string]string, input []byte, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = directory
 	command.Env = os.Environ()
 	for key, value := range env {
 		command.Env = append(command.Env, key+"="+value)
 	}
-	command.Stdin = strings.NewReader(input)
+	command.Stdin = strings.NewReader(string(input))
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), strings.TrimSpace(string(output)))
 	}
 	return strings.TrimSpace(string(output)), nil
-}
-
-func PathInRepository(root string, elements ...string) string {
-	return filepath.Join(append([]string{root}, elements...)...)
 }
 
 func shellQuote(value string) string {
