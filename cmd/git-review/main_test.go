@@ -15,8 +15,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.1\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.1", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.2\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.2", flag, output)
 		}
 	}
 }
@@ -102,6 +102,36 @@ func TestSyncBaseMergesCurrentComparisonIntoReviewedState(t *testing.T) {
 	changes := readChanges(t, repository, binary)
 	if len(changes) != 1 || changes[0].Path != "unaccepted.txt" {
 		t.Fatalf("changes = %#v, want unaccepted fragment", changes)
+	}
+}
+
+func TestGroupAddCommitFromBeforeMergedReviewBase(t *testing.T) {
+	repository := newRepository(t, map[string]string{"base.txt": "initial\n"})
+	runCommand(t, repository, "git", "checkout", "-b", "feature")
+	writeFile(t, repository, "redispatch-api/defaults.txt", "feature\n")
+	runCommand(t, repository, "git", "add", "redispatch-api/defaults.txt")
+	runCommand(t, repository, "git", "commit", "-m", "feature change")
+	featureCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, "git", "checkout", "main")
+	runCommand(t, repository, "git", "checkout", "-b", "develop")
+	writeFile(t, repository, "develop.txt", "develop\n")
+	runCommand(t, repository, "git", "add", "develop.txt")
+	runCommand(t, repository, "git", "commit", "-m", "develop change")
+	runCommand(t, repository, "git", "checkout", "feature")
+	runCommand(t, repository, "git", "merge", "--no-edit", "develop")
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "develop")
+	changes := readChanges(t, repository, binary)
+	if len(changes) != 1 || changes[0].Commit != featureCommit {
+		t.Fatalf("changes = %#v, want feature fragment", changes)
+	}
+	runCommand(t, repository, binary, "group", "add", "--name", "plant backend default", "--commit", featureCommit, "--path", "redispatch-api/...")
+	var groups []groupStatus
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || len(groups[0].Fragments) != 1 || groups[0].Fragments[0].Path != "redispatch-api/defaults.txt" {
+		t.Fatalf("groups = %#v, want feature fragment assigned by commit and path", groups)
 	}
 }
 

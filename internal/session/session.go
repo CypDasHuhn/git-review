@@ -96,6 +96,7 @@ func (f Fragment) Label() string {
 }
 
 func (f Fragment) TouchesPath(path string) bool {
+	path = strings.TrimSuffix(path, "/...")
 	path = strings.TrimSuffix(path, "/")
 	return f.Path == path || f.OldPath == path || strings.HasPrefix(f.Path, path+"/") || strings.HasPrefix(f.OldPath, path+"/")
 }

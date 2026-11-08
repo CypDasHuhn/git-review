@@ -14,7 +14,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.1"
+const version = "0.4.2"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -858,31 +858,19 @@ func assignFragments(ctx context.Context, name, ref, path string, oldStart, oldL
 	if err != nil {
 		return fmt.Errorf("resolve commit %q: %w", ref, err)
 	}
-	inReview, err := repo.IsAncestor(ctx, state.PinnedComparisonCommit, commit.Hash)
+	reviewFragments, err := repo.ReviewFragments(ctx, state.PinnedComparisonCommit, "HEAD")
 	if err != nil {
-		return err
-	}
-	if !inReview {
-		return fmt.Errorf("commit %s is before the review base", commit.ShortHash)
-	}
-	inWork, err := repo.IsAncestor(ctx, commit.Hash, "HEAD")
-	if err != nil {
-		return err
-	}
-	if !inWork {
-		return fmt.Errorf("commit %s is not contained in the work branch", commit.ShortHash)
-	}
-	patches, err := repo.CommitFragments(ctx, commit.Hash)
-	if err != nil {
-		return fmt.Errorf("find fragments for commit %s: %w", commit.ShortHash, err)
+		return fmt.Errorf("find current review fragments: %w", err)
 	}
 	specific := oldStart >= 0 || oldLines >= 0 || newStart >= 0 || newLines >= 0
 	if specific && (path == "" || oldStart < 0 || oldLines < 0 || newStart < 0 || newLines < 0) {
 		return errors.New("fragment selection requires --path and all source range flags")
 	}
 	var selected []session.Fragment
-	for _, patch := range patches {
-		fragment := patch.Fragment
+	for _, fragment := range reviewFragments {
+		if fragment.Commit != commit.Hash {
+			continue
+		}
 		if path != "" && !fragment.TouchesPath(path) {
 			continue
 		}
