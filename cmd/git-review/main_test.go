@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.5\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.5", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.6\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.6", flag, output)
 		}
 	}
 }
@@ -144,6 +144,31 @@ func TestInitInstallsHookInCommonDirectoryForWorktree(t *testing.T) {
 	}
 	if strings.Count(string(hook), "sync-base --hook") != 1 {
 		t.Fatalf("post-merge hook = %q", hook)
+	}
+}
+
+func TestAcceptOutputsEmptyListsAsArrays(t *testing.T) {
+	repository := newRepository(t, map[string]string{"README.md": "initial\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "changed.txt", "changed\n")
+	runCommand(t, repository, "git", "add", "changed.txt")
+	runCommand(t, repository, "git", "commit", "-m", "change")
+
+	output := runCommand(t, repository, binary, "accept", "--path", "changed.txt")
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(output), &response); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"accepted", "materialized", "pending"} {
+		raw, ok := response[field]
+		if !ok || strings.TrimSpace(string(raw)) == "null" {
+			t.Fatalf("%s = %q, want JSON array", field, raw)
+		}
+		var values []string
+		if err := json.Unmarshal(raw, &values); err != nil {
+			t.Fatalf("%s = %q is not a string array: %v", field, raw, err)
+		}
 	}
 }
 
@@ -454,6 +479,49 @@ func TestGroupProjectReportsUnmaterializedDependencies(t *testing.T) {
 	}
 	if len(projection.Fragments) != 0 || len(projection.Blocked) != 1 || projection.Complete {
 		t.Fatalf("blocked projection = %#v, want dependency blocker", projection)
+	}
+}
+
+func TestGroupProjectHandlesMergeFormattingDrift(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "start\nend\n"})
+	runCommand(t, repository, "git", "checkout", "-b", "develop")
+	writeFile(t, repository, "example.txt", "start\ncontext\nend\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "develop context")
+	runCommand(t, repository, "git", "checkout", "main")
+	runCommand(t, repository, "git", "checkout", "-b", "feature")
+	writeFile(t, repository, "example.txt", "start\nif value {\n    one\n}\nend\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "feature block")
+	featureCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	if output, err := runCommandError(t, repository, "git", "merge", "--no-ff", "--no-commit", "develop"); err == nil {
+		t.Fatalf("merge unexpectedly succeeded: %s", output)
+	}
+	writeFile(t, repository, "example.txt", "start\ncontext\nif value\n{\n    one\n}\nend\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "merge context")
+	writeFile(t, repository, "example.txt", "start\ncontext\nresult\nend\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "replace block")
+	replacementCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "develop")
+	runCommand(t, repository, binary, "group", "add", "--name", "runtime", "--commit", featureCommit)
+	runCommand(t, repository, binary, "group", "add", "--name", "runtime", "--commit", replacementCommit)
+	var projection struct {
+		Fragments []string `json:"fragments"`
+		Blocked   []string `json:"blocked"`
+		Complete  bool     `json:"complete"`
+		Ref       string   `json:"ref"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "project", "--name", "runtime")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Fragments) != 2 || len(projection.Blocked) != 0 || projection.Complete {
+		t.Fatalf("projection = %#v, want two displayable fragments", projection)
+	}
+	if content := runCommand(t, repository, "git", "show", projection.Ref+":example.txt"); content != "start\ncontext\nresult\nend\n" {
+		t.Fatalf("projection content = %q, want formatted merge drift resolved", content)
 	}
 }
 

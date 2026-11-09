@@ -5,7 +5,7 @@ import "testing"
 func TestLocateEditFollowsShiftedSourceLines(t *testing.T) {
 	source := []string{"one", "two", "three", "four"}
 	current := []string{"zero", "one", "two", "three", "four"}
-	position, err := locateEdit(source, current, 2, 1)
+	position, _, err := locateEdit(source, current, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -17,7 +17,7 @@ func TestLocateEditFollowsShiftedSourceLines(t *testing.T) {
 func TestLocateEditRejectsAmbiguousInsertion(t *testing.T) {
 	source := []string{"a", "b", "a", "b", "a", "b", "a"}
 	current := []string{"shift", "a", "b", "a", "b", "a", "b", "a"}
-	if _, err := locateEdit(source, current, 2, 0); err == nil {
+	if _, _, err := locateEdit(source, current, 2, 0); err == nil {
 		t.Fatal("locateEdit unexpectedly chose an ambiguous insertion")
 	}
 }
@@ -25,7 +25,43 @@ func TestLocateEditRejectsAmbiguousInsertion(t *testing.T) {
 func TestLocateEditRejectsMissingSourceLines(t *testing.T) {
 	source := []string{"one", "two", "three"}
 	current := []string{"one", "changed", "three"}
-	if _, err := locateEdit(source, current, 2, 1); err == nil {
+	if _, _, err := locateEdit(source, current, 2, 1); err == nil {
 		t.Fatal("locateEdit unexpectedly located missing source lines")
+	}
+}
+
+func TestLocateEditFollowsWhitespaceLineDrift(t *testing.T) {
+	source := []string{"before", "if (value)", "{", "return value;", "}", "after"}
+	current := []string{"before", "if (value) {", "return value;", "}", "after"}
+	position, matchedLines, err := locateEdit(source, current, 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != 1 || matchedLines != 3 {
+		t.Fatalf("location = (%d, %d), want (1, 3)", position, matchedLines)
+	}
+}
+
+func TestLocateEditFollowsInsertedContextBeforeInsertion(t *testing.T) {
+	source := []string{"start", "end"}
+	current := []string{"start", "context", "end"}
+	position, matchedLines, err := locateEdit(source, current, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != 2 || matchedLines != 0 {
+		t.Fatalf("location = (%d, %d), want (2, 0)", position, matchedLines)
+	}
+}
+
+func TestLocateEditUsesUniqueBeforeContextWhenAfterContextDrifted(t *testing.T) {
+	source := []string{"first", "target", "after", "second", "target", "after"}
+	current := []string{"first", "target", "after", "second", "target", "changed"}
+	position, matchedLines, err := locateEdit(source, current, 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != 4 || matchedLines != 1 {
+		t.Fatalf("location = (%d, %d), want (4, 1)", position, matchedLines)
 	}
 }

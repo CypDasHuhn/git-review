@@ -15,7 +15,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.5"
+const version = "0.4.6"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -350,10 +350,11 @@ func accept(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	pending := pendingFragmentIDs(state)
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{
-		"accepted":     state.AcceptedFragments,
-		"materialized": materialized,
-		"pending":      pendingFragmentIDs(state),
+		"accepted":     nonNilStrings(state.AcceptedFragments),
+		"materialized": nonNilStrings(materialized),
+		"pending":      nonNilStrings(pending),
 	})
 }
 
@@ -701,11 +702,12 @@ func acceptGroup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	pending := pendingFragmentIDs(state)
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{
 		"group":        *name,
-		"accepted":     fragmentIDs(selected),
-		"materialized": materialized,
-		"pending":      pendingFragmentIDs(state),
+		"accepted":     nonNilStrings(fragmentIDs(selected)),
+		"materialized": nonNilStrings(materialized),
+		"pending":      nonNilStrings(pending),
 	})
 }
 
@@ -1789,6 +1791,13 @@ func fragmentIDs(fragments []session.Fragment) []string {
 		ids = append(ids, fragment.ID())
 	}
 	return ids
+}
+
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func pendingFragmentIDs(state session.State) []string {

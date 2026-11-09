@@ -290,17 +290,17 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 		currentLines = nil
 		currentNewline = true
 	}
-	position, err := locateEdit(sourceLines, currentLines, patch.Fragment.OldStart, patch.Fragment.OldLines)
+	position, matchedLines, err := locateEdit(sourceLines, currentLines, patch.Fragment.OldStart, patch.Fragment.OldLines)
 	if err != nil {
 		return "", fmt.Errorf("locate fragment %s: %w", patch.Fragment.Label(), err)
 	}
-	if patch.Fragment.OldLines > 0 && position+patch.Fragment.OldLines > len(currentLines) {
+	if matchedLines > 0 && position+matchedLines > len(currentLines) {
 		return "", fmt.Errorf("fragment %s exceeds current file", patch.Fragment.Label())
 	}
-	updated := make([]string, 0, len(currentLines)-patch.Fragment.OldLines+len(patch.NewLines))
+	updated := make([]string, 0, len(currentLines)-matchedLines+len(patch.NewLines))
 	updated = append(updated, currentLines[:position]...)
 	updated = append(updated, patch.NewLines...)
-	updated = append(updated, currentLines[position+patch.Fragment.OldLines:]...)
+	updated = append(updated, currentLines[position+matchedLines:]...)
 	trailingNewline := currentNewline
 	targetData, targetExists, err := r.treeFile(ctx, patch.Fragment.Commit, patch.Fragment.Path)
 	if err != nil {
@@ -491,45 +491,131 @@ func joinLines(lines []string, trailingNewline bool) []byte {
 	return []byte(text)
 }
 
-func locateEdit(source, current []string, start, count int) (int, error) {
+type lineRange struct {
+	start int
+	end   int
+}
+
+func locateEdit(source, current []string, start, count int) (int, int, error) {
 	position := start - 1
 	if count == 0 {
 		position = start
 	}
 	if position < 0 || position > len(source) || position+count > len(source) {
-		return 0, errors.New("source range is invalid")
+		return 0, 0, errors.New("source range is invalid")
 	}
 	if sameLines(source, current) {
-		return position, nil
+		return position, count, nil
 	}
 	old := source[position : position+count]
 	if count > 0 {
 		candidates := sequencePositions(current, old)
+		if len(candidates) == 0 {
+			normalized := normalizedSequencePositions(current, old)
+			if len(normalized) == 1 {
+				return normalized[0].start, normalized[0].end - normalized[0].start, nil
+			}
+			if len(normalized) > 1 {
+				return 0, 0, errors.New("source lines are ambiguous in the reviewed state")
+			}
+		}
 		if len(candidates) == 1 {
-			return candidates[0], nil
+			return candidates[0], count, nil
 		}
 		for size := 3; size > 0; size-- {
 			before := source[max(0, position-size):position]
 			after := source[position+count : min(len(source), position+count+size)]
 			filtered := filterPositions(current, candidates, len(old), before, after)
 			if len(filtered) == 1 {
-				return filtered[0], nil
+				return filtered[0], count, nil
+			}
+			if len(before) > 0 {
+				filtered = filterBeforePositions(current, candidates, before)
+				if len(filtered) == 1 {
+					return filtered[0], count, nil
+				}
+			}
+			if len(after) > 0 {
+				filtered = filterAfterPositions(current, candidates, len(old), after)
+				if len(filtered) == 1 {
+					return filtered[0], count, nil
+				}
 			}
 		}
 		if len(candidates) == 0 {
-			return 0, errors.New("source lines are not present in the reviewed state")
+			return 0, 0, errors.New("source lines are not present in the reviewed state")
 		}
-		return 0, errors.New("source lines are ambiguous in the reviewed state")
+		return 0, 0, errors.New("source lines are ambiguous in the reviewed state")
 	}
 	for size := 3; size > 0; size-- {
 		before := source[max(0, position-size):position]
 		after := source[position:min(len(source), position+size)]
 		candidates := boundaryPositions(current, before, after)
 		if len(candidates) == 1 {
-			return candidates[0], nil
+			return candidates[0], 0, nil
 		}
 	}
-	return 0, errors.New("insertion anchors are ambiguous or missing in the reviewed state")
+	before := source[max(0, position-3):position]
+	after := source[position:min(len(source), position+3)]
+	candidates := fuzzyBoundaryPositions(current, before, after)
+	if len(candidates) == 1 {
+		return candidates[0], 0, nil
+	}
+	return 0, 0, errors.New("insertion anchors are ambiguous or missing in the reviewed state")
+}
+
+func normalizedSequencePositions(lines, sequence []string) []lineRange {
+	target := normalizedLines(sequence)
+	if target == "" {
+		return nil
+	}
+	var positions []lineRange
+	for start := range lines {
+		var builder strings.Builder
+		for end := start; end < len(lines); end++ {
+			if builder.Len() > 0 {
+				builder.WriteByte(' ')
+			}
+			builder.WriteString(strings.TrimSpace(lines[end]))
+			value := builder.String()
+			if value == target {
+				positions = append(positions, lineRange{start: start, end: end + 1})
+				break
+			}
+			if len(value) >= len(target) {
+				break
+			}
+		}
+	}
+	return positions
+}
+
+func normalizedLines(lines []string) string {
+	values := make([]string, len(lines))
+	for index, line := range lines {
+		values[index] = strings.TrimSpace(line)
+	}
+	return strings.Join(values, " ")
+}
+
+func fuzzyBoundaryPositions(lines, before, after []string) []int {
+	beforePositions := sequencePositions(lines, before)
+	afterPositions := sequencePositions(lines, after)
+	var candidates []int
+	seen := map[int]bool{}
+	for _, beforePosition := range beforePositions {
+		beforeEnd := beforePosition + len(before)
+		for _, afterPosition := range afterPositions {
+			if beforeEnd > afterPosition {
+				continue
+			}
+			if !seen[afterPosition] {
+				seen[afterPosition] = true
+				candidates = append(candidates, afterPosition)
+			}
+		}
+	}
+	return candidates
 }
 
 func sequencePositions(lines, sequence []string) []int {
@@ -575,6 +661,32 @@ func filterPositions(lines []string, positions []int, length int, before, after 
 			continue
 		}
 		filtered = append(filtered, position)
+	}
+	return filtered
+}
+
+func filterBeforePositions(lines []string, positions []int, before []string) []int {
+	var filtered []int
+	for _, position := range positions {
+		if len(before) > position {
+			continue
+		}
+		if sameLines(lines[position-len(before):position], before) {
+			filtered = append(filtered, position)
+		}
+	}
+	return filtered
+}
+
+func filterAfterPositions(lines []string, positions []int, length int, after []string) []int {
+	var filtered []int
+	for _, position := range positions {
+		if len(after) > len(lines)-position-length {
+			continue
+		}
+		if sameLines(lines[position+length:position+length+len(after)], after) {
+			filtered = append(filtered, position)
+		}
 	}
 	return filtered
 }
