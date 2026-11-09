@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.6\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.6", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.7\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.7", flag, output)
 		}
 	}
 }
@@ -522,6 +522,38 @@ func TestGroupProjectHandlesMergeFormattingDrift(t *testing.T) {
 	}
 	if content := runCommand(t, repository, "git", "show", projection.Ref+":example.txt"); content != "start\ncontext\nresult\nend\n" {
 		t.Fatalf("projection content = %q, want formatted merge drift resolved", content)
+	}
+}
+
+func TestGroupProjectHandlesFragmentAlreadyPresentInBase(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "old\n"})
+	runCommand(t, repository, "git", "checkout", "-b", "develop")
+	writeFile(t, repository, "example.txt", "new\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "develop change")
+	runCommand(t, repository, "git", "checkout", "main")
+	runCommand(t, repository, "git", "checkout", "-b", "feature")
+	writeFile(t, repository, "example.txt", "new\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "duplicate change")
+	commit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "develop")
+	runCommand(t, repository, binary, "group", "add", "--name", "duplicate", "--commit", commit)
+	var projection struct {
+		Fragments []string `json:"fragments"`
+		Blocked   []string `json:"blocked"`
+		Complete  bool     `json:"complete"`
+		Ref       string   `json:"ref"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "project", "--name", "duplicate")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Fragments) != 1 || len(projection.Blocked) != 0 || projection.Complete {
+		t.Fatalf("projection = %#v, want already-present fragment handled", projection)
+	}
+	if content := runCommand(t, repository, "git", "show", projection.Ref+":example.txt"); content != "new\n" {
+		t.Fatalf("projection content = %q, want new\\n", content)
 	}
 }
 

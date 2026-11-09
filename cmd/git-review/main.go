@@ -15,7 +15,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.6"
+const version = "0.4.7"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {

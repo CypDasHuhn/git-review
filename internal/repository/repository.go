@@ -292,6 +292,9 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 	}
 	position, matchedLines, err := locateEdit(sourceLines, currentLines, patch.Fragment.OldStart, patch.Fragment.OldLines)
 	if err != nil {
+		if isMissingEditContext(err) && fragmentAlreadyApplied(currentLines, patch.NewLines) {
+			return head, nil
+		}
 		return "", fmt.Errorf("locate fragment %s: %w", patch.Fragment.Label(), err)
 	}
 	if matchedLines > 0 && position+matchedLines > len(currentLines) {
@@ -360,6 +363,21 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 		return "", err
 	}
 	return commit, nil
+}
+
+func isMissingEditContext(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "source lines are not present") || strings.Contains(message, "insertion anchors are ambiguous or missing")
+}
+
+func fragmentAlreadyApplied(current, newLines []string) bool {
+	if len(newLines) == 0 {
+		return true
+	}
+	if len(sequencePositions(current, newLines)) == 1 {
+		return true
+	}
+	return len(normalizedSequencePositions(current, newLines)) == 1
 }
 
 func (r Repository) treeFile(ctx context.Context, ref, path string) ([]byte, bool, error) {
