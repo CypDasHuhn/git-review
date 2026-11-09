@@ -180,6 +180,11 @@ func GroupRef(workBranch, name string) string {
 	return "refs/git-review/" + strings.ReplaceAll(workBranch, " ", "-") + "/groups/" + hex.EncodeToString(hash[:8])
 }
 
+func ProjectionRef(workBranch, name string) string {
+	hash := sha256.Sum256([]byte(name))
+	return "refs/git-review/" + strings.ReplaceAll(workBranch, " ", "-") + "/projections/" + hex.EncodeToString(hash[:8])
+}
+
 func (s Store) path(workBranch string) string {
 	hash := sha256.Sum256([]byte(workBranch))
 	return filepath.Join(s.directory, hex.EncodeToString(hash[:])+".json")

@@ -180,7 +180,7 @@ func (r Repository) InstallPostMergeHook(ctx context.Context) error {
 func (r Repository) CreateRef(ctx context.Context, ref, commit string) error {
 	_, err := git(ctx, r.Root, "update-ref", ref, commit)
 	if err != nil {
-		return fmt.Errorf("create reviewed state %q: %w", ref, err)
+		return fmt.Errorf("create ref %q: %w", ref, err)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -15,9 +16,63 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.4\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.4", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.5\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.5", flag, output)
 		}
+	}
+}
+
+func TestStatusNoInitReportsMissingSessionWithoutWriting(t *testing.T) {
+	repository := newRepository(t, map[string]string{"README.md": "initial\n"})
+	binary := buildBinary(t)
+	beforeRefs := runCommand(t, repository, "git", "for-each-ref", "--format=%(refname)", "refs/git-review")
+	beforeStatus := runCommand(t, repository, "git", "status", "--porcelain")
+	var status struct {
+		SessionExists bool   `json:"sessionExists"`
+		WorkBranch    string `json:"workBranch"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "status", "--no-init")), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.SessionExists || status.WorkBranch != "main" {
+		t.Fatalf("status = %#v, want missing main session", status)
+	}
+	if after := runCommand(t, repository, "git", "for-each-ref", "--format=%(refname)", "refs/git-review"); after != beforeRefs {
+		t.Fatalf("review refs changed from %q to %q", beforeRefs, after)
+	}
+	if after := runCommand(t, repository, "git", "status", "--porcelain"); after != beforeStatus {
+		t.Fatalf("working tree status changed from %q to %q", beforeStatus, after)
+	}
+	if _, err := os.Stat(filepath.Join(repository, ".git", "git-review")); !os.IsNotExist(err) {
+		t.Fatalf("git-review metadata directory exists after no-init status: %v", err)
+	}
+}
+
+func TestStatusNoInitPreservesExistingSession(t *testing.T) {
+	repository := newRepository(t, map[string]string{"README.md": "initial\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	metadata := filepath.Join(repository, ".git", "git-review")
+	beforeFiles := snapshotDirectory(t, metadata)
+	beforeRefs := runCommand(t, repository, "git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/git-review")
+	beforeStatus := runCommand(t, repository, "git", "status", "--porcelain")
+	var status struct {
+		SessionExists bool `json:"sessionExists"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "status", "--no-init")), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.SessionExists {
+		t.Fatalf("status = %#v, want existing session", status)
+	}
+	if after := snapshotDirectory(t, metadata); !reflect.DeepEqual(after, beforeFiles) {
+		t.Fatalf("review metadata changed from %#v to %#v", beforeFiles, after)
+	}
+	if after := runCommand(t, repository, "git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/git-review"); after != beforeRefs {
+		t.Fatalf("review refs changed from %q to %q", beforeRefs, after)
+	}
+	if after := runCommand(t, repository, "git", "status", "--porcelain"); after != beforeStatus {
+		t.Fatalf("working tree status changed from %q to %q", beforeStatus, after)
 	}
 }
 
@@ -25,8 +80,10 @@ func TestHelpListsFragmentWorkflow(t *testing.T) {
 	binary := buildBinary(t)
 	rootHelp := runCommand(t, projectRoot(t), binary, "--help")
 	for _, line := range []string{
+		"git-review status [--json] [--no-init]",
 		"git-review fragment inspect --commit <commit> [--path <path>] [--json]",
 		"git-review fragment list --json [--unassigned]",
+		"git-review group project --name <name>",
 		"git-review group assign --name <name> --fragment <id> [--fragment <id>...]",
 	} {
 		if !strings.Contains(rootHelp, line) {
@@ -186,6 +243,217 @@ func TestReviewFragmentsIncludesMergedSideBranch(t *testing.T) {
 	}
 	if len(groups) != 1 || len(groups[0].Fragments) != 1 || groups[0].Fragments[0].Path != "source-side.txt" {
 		t.Fatalf("groups = %#v, want merged side-branch fragment assigned by commit", groups)
+	}
+}
+
+func TestSelectorAssignmentAcrossMergedHistory(t *testing.T) {
+	repository := newRepository(t, map[string]string{"base.txt": "initial\n"})
+	runCommand(t, repository, "git", "checkout", "-b", "develop")
+	writeFile(t, repository, "develop.txt", "develop\n")
+	runCommand(t, repository, "git", "add", "develop.txt")
+	runCommand(t, repository, "git", "commit", "-m", "develop change")
+	runCommand(t, repository, "git", "checkout", "main")
+	runCommand(t, repository, "git", "checkout", "-b", "source-side")
+	writeFile(t, repository, "redispatch-api/one/Mapping/Companies/first.txt", "first\n")
+	writeFile(t, repository, "redispatch-api/one/Other/first.txt", "other\n")
+	runCommand(t, repository, "git", "add", "redispatch-api/one/Mapping/Companies/first.txt", "redispatch-api/one/Other/first.txt")
+	runCommand(t, repository, "git", "commit", "-m", "company mapping one")
+	firstCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	writeFile(t, repository, "redispatch-api/two/Mapping/Companies/second.txt", "second\n")
+	runCommand(t, repository, "git", "add", "redispatch-api/two/Mapping/Companies/second.txt")
+	runCommand(t, repository, "git", "commit", "-m", "company mapping two")
+	secondCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, "git", "checkout", "develop")
+	runCommand(t, repository, "git", "checkout", "-b", "integration-side")
+	runCommand(t, repository, "git", "merge", "--no-edit", "--no-ff", "source-side")
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "develop")
+	var dryRun assignmentReport
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "assign", "--name", "company sync", "--path-glob", "redispatch-api/**/Mapping/Companies/**", "--dry-run", "--json")), &dryRun); err != nil {
+		t.Fatal(err)
+	}
+	if dryRun.Matched != 2 || dryRun.Assigned != 2 || !dryRun.DryRun {
+		t.Fatalf("dry-run report = %#v, want two matched and assignable fragments", dryRun)
+	}
+	var intersection assignmentReport
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "assign", "--name", "company sync", "--commit", firstCommit, "--path-glob", "redispatch-api/**/Mapping/Companies/**", "--dry-run", "--json")), &intersection); err != nil {
+		t.Fatal(err)
+	}
+	if intersection.Matched != 1 || intersection.Assigned != 1 {
+		t.Fatalf("commit/path intersection report = %#v, want one first-commit fragment", intersection)
+	}
+	if groups := runCommand(t, repository, binary, "group", "list", "--json"); groups != "[]\n" {
+		t.Fatalf("groups after dry-run = %q, want empty", groups)
+	}
+	var assigned assignmentReport
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "assign", "--name", "company sync", "--commit", firstCommit, "--commit", secondCommit, "--path-glob", "redispatch-api/**/Mapping/Companies/**", "--json")), &assigned); err != nil {
+		t.Fatal(err)
+	}
+	if assigned.Matched != 2 || assigned.Assigned != 2 || assigned.AlreadyAssigned != 0 || assigned.Skipped != 0 {
+		t.Fatalf("assignment report = %#v, want two newly assigned fragments", assigned)
+	}
+	var groups []groupStatus
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || len(groups[0].Fragments) != 2 {
+		t.Fatalf("groups = %#v, want two fragments assigned across merged commits", groups)
+	}
+	var projection struct {
+		Fragments []string `json:"fragments"`
+		Blocked   []string `json:"blocked"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "project", "--name", "company sync")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Fragments) != 2 || len(projection.Blocked) != 0 {
+		t.Fatalf("merged-history projection = %#v, want two displayable fragments", projection)
+	}
+}
+
+func TestSelectorAssignmentPreservesAndReassignsExistingFragments(t *testing.T) {
+	repository := newRepository(t, map[string]string{"base.txt": "initial\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "mapping/one.txt", "one\n")
+	writeFile(t, repository, "mapping/two.txt", "two\n")
+	runCommand(t, repository, "git", "add", "mapping/one.txt", "mapping/two.txt")
+	runCommand(t, repository, "git", "commit", "-m", "mapping changes")
+	runCommand(t, repository, binary, "group", "assign", "--name", "first", "--path-glob", "mapping/**", "--json")
+	var skipped assignmentReport
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "assign", "--name", "second", "--path-glob", "mapping/**", "--json")), &skipped); err != nil {
+		t.Fatal(err)
+	}
+	if skipped.Matched != 2 || skipped.Assigned != 0 || skipped.AlreadyAssigned != 2 {
+		t.Fatalf("preservation report = %#v, want existing assignments skipped", skipped)
+	}
+	var moved assignmentReport
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "assign", "--name", "second", "--path-glob", "mapping/**", "--reassign", "--json")), &moved); err != nil {
+		t.Fatal(err)
+	}
+	if moved.Matched != 2 || moved.Assigned != 2 {
+		t.Fatalf("reassignment report = %#v, want two moved fragments", moved)
+	}
+	var groups []groupStatus
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 || len(groups[0].Fragments) != 0 || len(groups[1].Fragments) != 2 {
+		t.Fatalf("groups after reassignment = %#v, want fragments moved to second", groups)
+	}
+}
+
+func TestFragmentAndGroupSummaryCounts(t *testing.T) {
+	repository := newRepository(t, map[string]string{"base.txt": "initial\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "company/one.txt", "one\n")
+	writeFile(t, repository, "other/two.txt", "two\n")
+	runCommand(t, repository, "git", "add", "company/one.txt", "other/two.txt")
+	runCommand(t, repository, "git", "commit", "-m", "first mapping")
+	writeFile(t, repository, "company/three.txt", "three\n")
+	runCommand(t, repository, "git", "add", "company/three.txt")
+	runCommand(t, repository, "git", "commit", "-m", "second mapping")
+	runCommand(t, repository, binary, "group", "assign", "--name", "company sync", "--path-glob", "company/**", "--json")
+	var fragments []fragmentStatus
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "fragment", "list", "--json")), &fragments); err != nil {
+		t.Fatal(err)
+	}
+	var fragmentSummary reviewSummary
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "fragment", "list", "--summary", "--json")), &fragmentSummary); err != nil {
+		t.Fatal(err)
+	}
+	if fragmentSummary.Total != len(fragments) || fragmentSummary.Assigned != 2 || fragmentSummary.Unassigned != 1 {
+		t.Fatalf("fragment summary = %#v, fragments = %#v", fragmentSummary, fragments)
+	}
+	var groupSummary reviewSummary
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--summary", "--json")), &groupSummary); err != nil {
+		t.Fatal(err)
+	}
+	if groupSummary.Total != fragmentSummary.Total || groupSummary.Assigned != fragmentSummary.Assigned || len(groupSummary.Groups) != 1 {
+		t.Fatalf("group summary = %#v, fragment summary = %#v", groupSummary, fragmentSummary)
+	}
+	var filtered reviewSummary
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "fragment", "list", "--summary", "--json", "--group", "company sync")), &filtered); err != nil {
+		t.Fatal(err)
+	}
+	if filtered.Total != 2 || filtered.Assigned != 2 || filtered.Unassigned != 0 || len(filtered.Groups) != 1 || filtered.Groups[0].Commits != 2 || filtered.Groups[0].Paths != 2 {
+		t.Fatalf("filtered summary = %#v, want two company fragments from two commits", filtered)
+	}
+}
+
+func TestGroupProjectCreatesProjectionWithoutChangingReviewedState(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "before\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "example.txt", "first\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "first change")
+	first := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	writeFile(t, repository, "example.txt", "second\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "second change")
+	second := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, binary, "group", "add", "--name", "example", "--commit", first)
+	runCommand(t, repository, binary, "group", "add", "--name", "example", "--commit", second)
+	reviewedBefore := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", session.ReviewedRef("main")))
+	var projection struct {
+		Name        string   `json:"name"`
+		Ref         string   `json:"ref"`
+		Commit      string   `json:"commit"`
+		ReviewedRef string   `json:"reviewedRef"`
+		Fragments   []string `json:"fragments"`
+		Blocked     []string `json:"blocked"`
+		Complete    bool     `json:"complete"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "project", "--name", "example")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if projection.Name != "example" || projection.Ref == "" || projection.Commit == "" || len(projection.Fragments) != 2 || len(projection.Blocked) != 0 || projection.Complete {
+		t.Fatalf("projection = %#v, want two displayable fragments", projection)
+	}
+	if reviewedAfter := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", session.ReviewedRef("main"))); reviewedAfter != reviewedBefore {
+		t.Fatalf("reviewed ref changed from %s to %s", reviewedBefore, reviewedAfter)
+	}
+	if content := runCommand(t, repository, "git", "show", projection.Ref+":example.txt"); content != "second\n" {
+		t.Fatalf("projection content = %q, want second\n", content)
+	}
+	if files := runCommand(t, repository, "git", "diff", "--name-only", projection.ReviewedRef+".."+projection.Ref); files != "example.txt\n" {
+		t.Fatalf("projection files = %q, want example.txt", files)
+	}
+	runCommand(t, repository, binary, "group", "accept", "--name", "example", "--path", "example.txt")
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "project", "--name", "example")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if !projection.Complete || len(projection.Fragments) != 0 || len(projection.Blocked) != 0 {
+		t.Fatalf("completed projection = %#v, want no remaining fragments", projection)
+	}
+}
+
+func TestGroupProjectReportsUnmaterializedDependencies(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "before\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "example.txt", "first\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "first change")
+	first := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	writeFile(t, repository, "example.txt", "second\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "second change")
+	second := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, binary, "group", "add", "--name", "first", "--commit", first)
+	runCommand(t, repository, binary, "group", "add", "--name", "second", "--commit", second)
+	var projection struct {
+		Fragments []string `json:"fragments"`
+		Blocked   []string `json:"blocked"`
+		Complete  bool     `json:"complete"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "project", "--name", "second")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Fragments) != 0 || len(projection.Blocked) != 1 || projection.Complete {
+		t.Fatalf("blocked projection = %#v, want dependency blocker", projection)
 	}
 }
 
@@ -474,6 +742,36 @@ func writeFile(t *testing.T, repository, path, content string) {
 	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func snapshotDirectory(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snapshot := map[string]string{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		snapshot[relative] = string(contents)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 func buildBinary(t *testing.T) string {

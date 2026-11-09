@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"sort"
 	"strings"
 
@@ -14,7 +15,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.4"
+const version = "0.4.5"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -213,17 +214,27 @@ func syncBase(ctx context.Context, args []string) error {
 }
 
 func showStatus(ctx context.Context, args []string) error {
+	if helpRequested(args) {
+		return statusUsage()
+	}
 	flags := flag.NewFlagSet("status", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	asJSON := flags.Bool("json", false, "write structured JSON")
+	noInit := flags.Bool("no-init", false, "inspect without creating or updating a review session")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errors.New("status does not accept positional arguments")
 	}
-	repo, state, err := currentSession(ctx)
+	repo, workBranch, state, err := loadCurrentSession(ctx)
 	if err != nil {
+		if *noInit && errors.Is(err, session.ErrNotFound) {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"sessionExists": false,
+				"workBranch":    workBranch,
+			})
+		}
 		return err
 	}
 	head, err := repo.ResolveCommit(ctx, "HEAD")
@@ -270,6 +281,12 @@ func showStatus(ctx context.Context, args []string) error {
 		AcceptedCount:           len(accepted),
 		MaterializedCount:       len(materialized),
 		PendingCount:            countPending(accepted, materialized),
+	}
+	if *noInit {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			SessionExists bool `json:"sessionExists"`
+			session.Status
+		}{SessionExists: true, Status: status})
 	}
 	if *asJSON {
 		return json.NewEncoder(os.Stdout).Encode(status)
@@ -549,11 +566,19 @@ func listFragments(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("fragment list", flag.ContinueOnError)
 	asJSON := flags.Bool("json", false, "write structured JSON")
 	unassigned := flags.Bool("unassigned", false, "list only unassigned fragments")
+	summary := flags.Bool("summary", false, "show compact review statistics")
+	group := flags.String("group", "", "limit summary statistics to a review group")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || !*asJSON {
-		return errors.New("fragment list requires --json")
+	if flags.NArg() != 0 || (!*asJSON && !*summary) {
+		return errors.New("fragment list requires --json or --summary")
+	}
+	if !*summary && *group != "" {
+		return errors.New("fragment list --group requires --summary")
+	}
+	if *summary && *unassigned && *group != "" {
+		return errors.New("fragment list cannot combine --unassigned and --group")
 	}
 	repo, state, err := currentSession(ctx)
 	if err != nil {
@@ -576,6 +601,17 @@ func listFragments(ctx context.Context, args []string) error {
 		}
 		statuses = filtered
 	}
+	if *summary {
+		value, err := summaryForGroup(statuses, groups, *group)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(value)
+		}
+		printReviewSummary(value)
+		return nil
+	}
 	return json.NewEncoder(os.Stdout).Encode(statuses)
 }
 
@@ -592,6 +628,8 @@ func group(ctx context.Context, args []string) error {
 		return listGroups(ctx, args[1:])
 	case "view":
 		return viewGroup(ctx, args[1:])
+	case "project":
+		return projectGroup(ctx, args[1:])
 	case "accept":
 		return acceptGroup(ctx, args[1:])
 	default:
@@ -605,11 +643,12 @@ func acceptGroup(ctx context.Context, args []string) error {
 	}
 	flags := flag.NewFlagSet("group accept", flag.ContinueOnError)
 	name := flags.String("name", "", "review group name")
-	path := flags.String("path", "", "changed file path")
+	var paths stringList
+	flags.Var(&paths, "path", "changed file path")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *name == "" || *path == "" {
+	if flags.NArg() != 0 || *name == "" || len(paths) == 0 {
 		return errors.New("group accept requires --name and --path")
 	}
 	repo, state, err := currentSession(ctx)
@@ -627,12 +666,15 @@ func acceptGroup(ctx context.Context, args []string) error {
 			continue
 		}
 		for _, fragment := range group.Fragments {
-			if fragment.TouchesPath(*path) {
-				selected = append(selected, fragment)
+			for _, path := range paths {
+				if fragment.TouchesPath(path) {
+					selected = append(selected, fragment)
+					break
+				}
 			}
 		}
 		if len(selected) == 0 {
-			return fmt.Errorf("review group %q has no fragments for %q", *name, *path)
+			return fmt.Errorf("review group %q has no fragments for %q", *name, strings.Join(paths, ", "))
 		}
 		break
 	}
@@ -712,6 +754,100 @@ func viewGroup(ctx context.Context, args []string) error {
 	return fmt.Errorf("review group %q does not exist", *name)
 }
 
+func projectGroup(ctx context.Context, args []string) error {
+	if helpRequested(args) {
+		return groupProjectUsage()
+	}
+	flags := flag.NewFlagSet("group project", flag.ContinueOnError)
+	name := flags.String("name", "", "review group name")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *name == "" {
+		return errors.New("group project requires --name")
+	}
+	repo, state, err := currentSession(ctx)
+	if err != nil {
+		return err
+	}
+	groups, err := session.NewStore(repo.GitDir).LoadGroups(state.WorkBranch)
+	if err != nil {
+		return err
+	}
+	groupIndex := groupIndex(groups, *name)
+	if groupIndex < 0 {
+		return fmt.Errorf("review group %q does not exist", *name)
+	}
+	fragments, err := allFragments(ctx, repo, state)
+	if err != nil {
+		return err
+	}
+	dependencies := fragmentDependencies(fragments)
+	selected := map[string]bool{}
+	for _, fragment := range groups[groupIndex].Fragments {
+		selected[fragment.ID()] = true
+	}
+	materialized := stringSet(state.MaterializedFragments)
+	projectionRef := session.ProjectionRef(state.WorkBranch, *name)
+	if err := repo.CreateRef(ctx, projectionRef, state.ReviewedRef); err != nil {
+		return err
+	}
+	applied := map[string]bool{}
+	appliedIDs := make([]string, 0)
+	for {
+		progress := false
+		for _, fragment := range fragments {
+			id := fragment.ID()
+			if !selected[id] || materialized[id] || applied[id] {
+				continue
+			}
+			ready := true
+			for _, dependency := range dependencies[id] {
+				if !materialized[dependency] && !applied[dependency] {
+					ready = false
+					break
+				}
+			}
+			if !ready {
+				continue
+			}
+			patch, err := repo.FragmentPatch(ctx, fragment)
+			if err != nil {
+				return err
+			}
+			if _, err := repo.ApplyFragment(ctx, projectionRef, patch); err != nil {
+				return fmt.Errorf("project fragment %s: %w", fragment.Label(), err)
+			}
+			applied[id] = true
+			appliedIDs = append(appliedIDs, id)
+			progress = true
+		}
+		if !progress {
+			break
+		}
+	}
+	blockedIDs := make([]string, 0)
+	for _, fragment := range fragments {
+		id := fragment.ID()
+		if selected[id] && !materialized[id] && !applied[id] {
+			blockedIDs = append(blockedIDs, id)
+		}
+	}
+	commit, err := repo.ResolveCommit(ctx, projectionRef)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"name":        *name,
+		"ref":         projectionRef,
+		"commit":      commit,
+		"reviewedRef": state.ReviewedRef,
+		"fragments":   appliedIDs,
+		"blocked":     blockedIDs,
+		"complete":    len(blockedIDs) == 0 && len(appliedIDs) == 0,
+	})
+}
+
 func assignGroup(ctx context.Context, args []string) error {
 	if helpRequested(args) {
 		return groupAssignUsage()
@@ -719,30 +855,44 @@ func assignGroup(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("group assign", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	name := flags.String("name", "", "review group name")
-	commit := flags.String("commit", "", "commit hash")
+	var commits stringList
+	flags.Var(&commits, "commit", "commit hash")
 	var fragmentIDs stringList
 	flags.Var(&fragmentIDs, "fragment", "fragment ID")
-	path := flags.String("path", "", "changed file path")
+	var paths stringList
+	flags.Var(&paths, "path", "changed file path")
+	var pathGlobs stringList
+	flags.Var(&pathGlobs, "path-glob", "changed file path glob")
 	oldStart := flags.Int("old-start", -1, "source hunk old start")
 	oldLines := flags.Int("old-lines", -1, "source hunk old line count")
 	newStart := flags.Int("new-start", -1, "source hunk new start")
 	newLines := flags.Int("new-lines", -1, "source hunk new line count")
+	reassign := flags.Bool("reassign", false, "move matching fragments from another group")
+	dryRun := flags.Bool("dry-run", false, "report selector matches without changing review state")
+	asJSON := flags.Bool("json", false, "write structured JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *name == "" {
-		return errors.New("group assign requires --name and --commit")
+		return errors.New("group assign requires --name and a selector")
 	}
 	if len(fragmentIDs) > 0 {
-		if *commit != "" || *path != "" || *oldStart >= 0 || *oldLines >= 0 || *newStart >= 0 || *newLines >= 0 {
+		if len(commits) > 0 || len(paths) > 0 || len(pathGlobs) > 0 || *oldStart >= 0 || *oldLines >= 0 || *newStart >= 0 || *newLines >= 0 || *reassign || *dryRun {
 			return errors.New("group assign with --fragment requires --name and --fragment only")
 		}
 		return assignFragmentIDs(ctx, *name, fragmentIDs)
 	}
-	if *commit == "" {
-		return errors.New("group assign requires --name and --commit or --fragment")
+	specific := *oldStart >= 0 || *oldLines >= 0 || *newStart >= 0 || *newLines >= 0
+	if specific {
+		if len(commits) != 1 || len(paths) != 1 || len(pathGlobs) > 0 || *reassign || *dryRun {
+			return errors.New("fragment selection requires one --commit, one --path, and all source range flags")
+		}
+		return assignFragments(ctx, *name, commits[0], paths[0], *oldStart, *oldLines, *newStart, *newLines)
 	}
-	return assignFragments(ctx, *name, *commit, *path, *oldStart, *oldLines, *newStart, *newLines)
+	if len(commits) == 0 && len(paths) == 0 && len(pathGlobs) == 0 {
+		return errors.New("group assign requires at least one selector")
+	}
+	return assignSelectedFragments(ctx, *name, commits, paths, pathGlobs, *reassign, *dryRun, *asJSON)
 }
 
 func addGroupCommit(ctx context.Context, args []string) error {
@@ -927,12 +1077,292 @@ func assignFragments(ctx context.Context, name, ref, path string, oldStart, oldL
 	})
 }
 
+type assignmentReport struct {
+	Group           string   `json:"group"`
+	Commit          string   `json:"commit,omitempty"`
+	ShortCommit     string   `json:"shortCommit,omitempty"`
+	Fragments       []string `json:"fragments,omitempty"`
+	DryRun          bool     `json:"dryRun"`
+	Matched         int      `json:"matched"`
+	Assigned        int      `json:"assigned"`
+	AlreadyAssigned int      `json:"alreadyAssigned"`
+	Skipped         int      `json:"skipped"`
+	Unmatched       int      `json:"unmatched"`
+}
+
+func assignSelectedFragments(ctx context.Context, name string, commitRefs, paths, pathGlobs []string, reassign, dryRun, asJSON bool) error {
+	repo, state, err := currentSession(ctx)
+	if err != nil {
+		return err
+	}
+	normalizedPaths := make([]string, 0, len(paths))
+	for _, value := range paths {
+		value = strings.TrimPrefix(value, "./")
+		if value == "" || strings.HasPrefix(value, "/") {
+			return fmt.Errorf("path selector %q must be repository-relative", value)
+		}
+		normalizedPaths = append(normalizedPaths, value)
+	}
+	paths = normalizedPaths
+	selectorCommits := map[string]bool{}
+	var selectedCommit string
+	var selectedShortCommit string
+	for _, ref := range commitRefs {
+		commit, err := repo.CommitInfo(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("resolve commit %q: %w", ref, err)
+		}
+		selectorCommits[commit.Hash] = true
+		if len(commitRefs) == 1 {
+			selectedCommit = commit.Hash
+			selectedShortCommit = commit.ShortHash
+		}
+	}
+	for _, pattern := range pathGlobs {
+		if err := validatePathGlob(pattern); err != nil {
+			return fmt.Errorf("invalid path glob %q: %w", pattern, err)
+		}
+	}
+	reviewFragments, err := repo.ReviewFragments(ctx, state.PinnedComparisonCommit, "HEAD")
+	if err != nil {
+		return fmt.Errorf("find current review fragments: %w", err)
+	}
+	groups, err := session.NewStore(repo.GitDir).LoadGroups(state.WorkBranch)
+	if err != nil {
+		return err
+	}
+	statuses, err := fragmentStatuses(ctx, repo, state, groups)
+	if err != nil {
+		return err
+	}
+	statusByID := make(map[string]fragmentStatus, len(statuses))
+	for _, status := range statuses {
+		statusByID[status.ID] = status
+	}
+	var matched []session.Fragment
+	var selected []session.Fragment
+	alreadyAssigned := 0
+	skipped := 0
+	for _, fragment := range reviewFragments {
+		if !matchesFragmentSelector(fragment, selectorCommits, paths, pathGlobs) {
+			continue
+		}
+		matched = append(matched, fragment)
+		status, found := statusByID[fragment.ID()]
+		if !found || !status.Assignable {
+			skipped++
+			continue
+		}
+		if status.Group != "" {
+			if status.Group == name || !reassign {
+				alreadyAssigned++
+				continue
+			}
+		}
+		selected = append(selected, fragment)
+	}
+	report := assignmentReport{
+		Group:           name,
+		Commit:          selectedCommit,
+		ShortCommit:     selectedShortCommit,
+		DryRun:          dryRun,
+		Matched:         len(matched),
+		AlreadyAssigned: alreadyAssigned,
+		Skipped:         skipped,
+		Fragments:       fragmentIDs(selected),
+	}
+	if report.Matched == 0 {
+		report.Unmatched = 1
+	}
+	report.Assigned = len(selected)
+	if len(selected) > 0 {
+		prospective := cloneGroups(groups)
+		groupIndex := groupIndex(prospective, name)
+		if groupIndex < 0 {
+			prospective = append(prospective, session.Group{Name: name})
+			groupIndex = len(prospective) - 1
+		}
+		if reassign {
+			for index := range prospective {
+				if index == groupIndex {
+					continue
+				}
+				prospective[index].Fragments = removeFragments(prospective[index].Fragments, selected)
+			}
+		}
+		for _, fragment := range selected {
+			if !containsFragment(prospective[groupIndex].Fragments, fragment) {
+				prospective[groupIndex].Fragments = append(prospective[groupIndex].Fragments, fragment)
+			}
+		}
+		if err := validateGroupGraph(ctx, repo, state, prospective); err != nil {
+			return err
+		}
+		if !dryRun {
+			if err := session.NewStore(repo.GitDir).SaveGroups(state.WorkBranch, prospective); err != nil {
+				return err
+			}
+		}
+	}
+	if !dryRun || asJSON {
+		return json.NewEncoder(os.Stdout).Encode(report)
+	}
+	fmt.Printf("Matched: %d fragments\n", report.Matched)
+	fmt.Printf("Assigned: %d\n", report.Assigned)
+	fmt.Printf("Already assigned: %d\n", report.AlreadyAssigned)
+	fmt.Printf("Skipped: %d\n", report.Skipped)
+	fmt.Printf("Unmatched selectors: %d\n", report.Unmatched)
+	if dryRun {
+		fmt.Printf("Would assign to: %s\n", name)
+	} else {
+		fmt.Printf("Assigned to: %s\n", name)
+	}
+	return nil
+}
+
+func matchesFragmentSelector(fragment session.Fragment, commits map[string]bool, paths, pathGlobs []string) bool {
+	if len(commits) > 0 && !commits[fragment.Commit] {
+		return false
+	}
+	if len(paths) == 0 && len(pathGlobs) == 0 {
+		return true
+	}
+	for _, path := range paths {
+		if fragment.TouchesPath(path) {
+			return true
+		}
+	}
+	for _, pattern := range pathGlobs {
+		for _, path := range fragment.Paths() {
+			matched, err := matchPathGlob(pattern, path)
+			if err == nil && matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validatePathGlob(pattern string) error {
+	pattern = strings.TrimPrefix(pattern, "./")
+	if strings.HasPrefix(pattern, "/") || pattern == "" {
+		return errors.New("path glob must be a repository-relative path")
+	}
+	for _, part := range strings.Split(strings.Trim(pattern, "/"), "/") {
+		if part == "**" {
+			continue
+		}
+		if _, err := pathpkg.Match(part, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func matchPathGlob(pattern, candidate string) (bool, error) {
+	pattern = strings.TrimPrefix(pattern, "./")
+	candidate = strings.TrimPrefix(candidate, "./")
+	pattern = strings.Trim(pattern, "/")
+	candidate = strings.Trim(candidate, "/")
+	if pattern == "" {
+		return false, errors.New("path glob cannot be empty")
+	}
+	patternParts := strings.Split(pattern, "/")
+	candidateParts := strings.Split(candidate, "/")
+	type state struct {
+		patternIndex   int
+		candidateIndex int
+	}
+	memo := map[state]bool{}
+	seen := map[state]bool{}
+	var match func(int, int) (bool, error)
+	match = func(patternIndex, candidateIndex int) (bool, error) {
+		current := state{patternIndex: patternIndex, candidateIndex: candidateIndex}
+		if seen[current] {
+			return memo[current], nil
+		}
+		seen[current] = true
+		if patternIndex == len(patternParts) {
+			memo[current] = candidateIndex == len(candidateParts)
+			return memo[current], nil
+		}
+		if patternParts[patternIndex] == "**" {
+			matched, err := match(patternIndex+1, candidateIndex)
+			if err != nil {
+				return false, err
+			}
+			if matched {
+				memo[current] = true
+				return true, nil
+			}
+			if candidateIndex < len(candidateParts) {
+				matched, err = match(patternIndex, candidateIndex+1)
+				if err != nil {
+					return false, err
+				}
+				memo[current] = matched
+				return matched, nil
+			}
+			return false, nil
+		}
+		if candidateIndex == len(candidateParts) {
+			return false, nil
+		}
+		matched, err := pathpkg.Match(patternParts[patternIndex], candidateParts[candidateIndex])
+		if err != nil {
+			return false, err
+		}
+		if !matched {
+			return false, nil
+		}
+		matched, err = match(patternIndex+1, candidateIndex+1)
+		memo[current] = matched
+		return matched, err
+	}
+	return match(0, 0)
+}
+
+func cloneGroups(groups []session.Group) []session.Group {
+	cloned := make([]session.Group, len(groups))
+	for index, group := range groups {
+		cloned[index] = session.Group{Name: group.Name, Fragments: append([]session.Fragment{}, group.Fragments...)}
+	}
+	return cloned
+}
+
+func groupIndex(groups []session.Group, name string) int {
+	for index, group := range groups {
+		if group.Name == name {
+			return index
+		}
+	}
+	return -1
+}
+
+func removeFragments(fragments []session.Fragment, selected []session.Fragment) []session.Fragment {
+	selectedIDs := stringSet(fragmentIDs(selected))
+	remaining := make([]session.Fragment, 0, len(fragments))
+	for _, fragment := range fragments {
+		if !selectedIDs[fragment.ID()] {
+			remaining = append(remaining, fragment)
+		}
+	}
+	return remaining
+}
+
 func listGroups(ctx context.Context, args []string) error {
 	if helpRequested(args) {
 		return groupListUsage()
 	}
-	if len(args) != 1 || args[0] != "--json" {
-		return errors.New("group list requires --json")
+	flags := flag.NewFlagSet("group list", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	asJSON := flags.Bool("json", false, "write structured JSON")
+	summary := flags.Bool("summary", false, "show compact review statistics")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || (!*asJSON && !*summary) {
+		return errors.New("group list requires --json or --summary")
 	}
 	repo, state, err := currentSession(ctx)
 	if err != nil {
@@ -945,6 +1375,18 @@ func listGroups(ctx context.Context, args []string) error {
 	statuses, err := groupStatuses(ctx, repo, state, groups)
 	if err != nil {
 		return err
+	}
+	if *summary {
+		allStatuses, err := fragmentStatuses(ctx, repo, state, groups)
+		if err != nil {
+			return err
+		}
+		value := summarizeFragments(allStatuses, groups, "")
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(value)
+		}
+		printReviewSummary(value)
+		return nil
 	}
 	return json.NewEncoder(os.Stdout).Encode(statuses)
 }
@@ -968,6 +1410,100 @@ type fragmentView struct {
 type groupStatus struct {
 	Name      string           `json:"name"`
 	Fragments []fragmentStatus `json:"fragments"`
+}
+
+type reviewSummary struct {
+	Total      int            `json:"total"`
+	Assigned   int            `json:"assigned"`
+	Unassigned int            `json:"unassigned"`
+	Statuses   map[string]int `json:"statuses"`
+	Groups     []groupSummary `json:"groups"`
+}
+
+type groupSummary struct {
+	Name      string         `json:"name"`
+	Fragments int            `json:"fragments"`
+	Commits   int            `json:"commits"`
+	Paths     int            `json:"paths"`
+	Statuses  map[string]int `json:"statuses"`
+}
+
+func summaryForGroup(statuses []fragmentStatus, groups []session.Group, name string) (reviewSummary, error) {
+	if name != "" && groupIndex(groups, name) < 0 {
+		return reviewSummary{}, fmt.Errorf("review group %q does not exist", name)
+	}
+	return summarizeFragments(statuses, groups, name), nil
+}
+
+func summarizeFragments(statuses []fragmentStatus, groups []session.Group, groupFilter string) reviewSummary {
+	filtered := statuses
+	if groupFilter != "" {
+		filtered = make([]fragmentStatus, 0)
+		for _, status := range statuses {
+			if status.Group == groupFilter {
+				filtered = append(filtered, status)
+			}
+		}
+	}
+	summary := reviewSummary{
+		Total:    len(filtered),
+		Statuses: map[string]int{},
+		Groups:   make([]groupSummary, 0, len(groups)),
+	}
+	for _, status := range filtered {
+		if status.Assignment == "assigned" {
+			summary.Assigned++
+		} else {
+			summary.Unassigned++
+		}
+		summary.Statuses[status.Status]++
+	}
+	for _, group := range groups {
+		if groupFilter != "" && group.Name != groupFilter {
+			continue
+		}
+		groupSummary := groupSummary{Name: group.Name, Statuses: map[string]int{}}
+		commits := map[string]bool{}
+		paths := map[string]bool{}
+		for _, status := range filtered {
+			if status.Group != group.Name {
+				continue
+			}
+			groupSummary.Fragments++
+			commits[status.Commit] = true
+			for _, path := range status.Paths() {
+				paths[path] = true
+			}
+			groupSummary.Statuses[status.Status]++
+		}
+		groupSummary.Commits = len(commits)
+		groupSummary.Paths = len(paths)
+		summary.Groups = append(summary.Groups, groupSummary)
+	}
+	return summary
+}
+
+func printReviewSummary(summary reviewSummary) {
+	fmt.Printf("Total fragments: %d\n", summary.Total)
+	fmt.Printf("Assigned: %d\n", summary.Assigned)
+	fmt.Printf("Unassigned: %d\n", summary.Unassigned)
+	fmt.Println("Statuses:")
+	printCounts(summary.Statuses)
+	for _, group := range summary.Groups {
+		fmt.Printf("%s: %d fragments, %d commits, %d paths\n", group.Name, group.Fragments, group.Commits, group.Paths)
+		printCounts(group.Statuses)
+	}
+}
+
+func printCounts(counts map[string]int) {
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		fmt.Printf("  %s: %d\n", key, counts[key])
+	}
 }
 
 func formatFragmentPatch(patch repository.FragmentPatch) string {
@@ -1315,19 +1851,24 @@ func removeString(values []string, target string) []string {
 }
 
 func currentSession(ctx context.Context) (repository.Repository, session.State, error) {
+	repo, _, state, err := loadCurrentSession(ctx)
+	return repo, state, err
+}
+
+func loadCurrentSession(ctx context.Context) (repository.Repository, string, session.State, error) {
 	repo, err := repository.Open(ctx, "")
 	if err != nil {
-		return repository.Repository{}, session.State{}, err
+		return repository.Repository{}, "", session.State{}, err
 	}
 	workBranch, err := repo.CurrentBranch(ctx)
 	if err != nil {
-		return repository.Repository{}, session.State{}, err
+		return repository.Repository{}, "", session.State{}, err
 	}
 	state, err := session.NewStore(repo.GitDir).Load(workBranch)
 	if errors.Is(err, session.ErrNotFound) {
-		return repository.Repository{}, session.State{}, fmt.Errorf("no review session exists for %q: %w", workBranch, session.ErrNotFound)
+		return repo, workBranch, session.State{}, fmt.Errorf("no review session exists for %q: %w", workBranch, session.ErrNotFound)
 	}
-	return repo, state, err
+	return repo, workBranch, state, err
 }
 
 type stringList []string
@@ -1361,7 +1902,7 @@ func usage() error {
   git-review -v
   git-review init [--base <ref>]
   git-review sync-base
-  git-review status [--json]
+  git-review status [--json] [--no-init]
   git-review accept --path <path> [--path <path>...]
   git-review undo
   git-review history
@@ -1369,18 +1910,30 @@ func usage() error {
   git-review changes --json
   git-review fragment inspect --commit <commit> [--path <path>] [--json]
   git-review fragment list --json [--unassigned]
+  git-review fragment list --summary [--json] [--group <name>]
   git-review group list --json
+  git-review group list --summary [--json]
   git-review group add --name <name> --commit <commit> [--path <path>]
   git-review group assign --name <name> --fragment <id> [--fragment <id>...]
-  git-review group assign --name <name> --commit <commit> [--path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>]
+  git-review group assign --name <name> [--commit <commit>...] [--path <path>...] [--path-glob <glob>...] [--reassign] [--dry-run] [--json]
+  git-review group assign --name <name> --commit <commit> --path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>
   git-review group view --name <name>
-  git-review group accept --name <name> --path <path>`)
+  git-review group project --name <name>
+  git-review group accept --name <name> --path <path> [--path <path>...]`)
+}
+
+func statusUsage() error {
+	return printUsage(`Usage:
+  git-review status [--json] [--no-init]
+
+Show review state. --no-init returns structured output and never creates or updates a review session.`)
 }
 
 func fragmentUsage() error {
 	return printUsage(`Usage:
   git-review fragment inspect --commit <commit> [--path <path>] [--json]
-  git-review fragment list --json [--unassigned]`)
+  git-review fragment list --json [--unassigned]
+  git-review fragment list --summary [--json] [--group <name>]`)
 }
 
 func fragmentInspectUsage() error {
@@ -1393,6 +1946,7 @@ Inspect the source fragments produced by a commit.`)
 func fragmentListUsage() error {
 	return printUsage(`Usage:
   git-review fragment list --json [--unassigned]
+  git-review fragment list --summary [--json] [--group <name>]
 
 List review fragments and their assignment status.`)
 }
@@ -1400,16 +1954,20 @@ List review fragments and their assignment status.`)
 func groupUsage() error {
 	return printUsage(`Usage:
   git-review group list --json
+  git-review group list --summary [--json]
   git-review group add --name <name> --commit <commit> [--path <path>]
   git-review group assign --name <name> --fragment <id> [--fragment <id>...]
-  git-review group assign --name <name> --commit <commit> [--path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>]
+  git-review group assign --name <name> [--commit <commit>...] [--path <path>...] [--path-glob <glob>...] [--reassign] [--dry-run] [--json]
+  git-review group assign --name <name> --commit <commit> --path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>
   git-review group view --name <name>
-  git-review group accept --name <name> --path <path>`)
+  git-review group project --name <name>
+  git-review group accept --name <name> --path <path> [--path <path>...]`)
 }
 
 func groupListUsage() error {
 	return printUsage(`Usage:
   git-review group list --json
+  git-review group list --summary [--json]
 
 List review groups and fragment statuses.`)
 }
@@ -1424,9 +1982,10 @@ Assign all matching fragments from a commit.`)
 func groupAssignUsage() error {
 	return printUsage(`Usage:
   git-review group assign --name <name> --fragment <id> [--fragment <id>...]
-  git-review group assign --name <name> --commit <commit> [--path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>]
+  git-review group assign --name <name> [--commit <commit>...] [--path <path>...] [--path-glob <glob>...] [--reassign] [--dry-run] [--json]
+  git-review group assign --name <name> --commit <commit> --path <path> --old-start <n> --old-lines <n> --new-start <n> --new-lines <n>
 
-Assign selected source fragments to a review group.`)
+Assign selected source fragments to a review group. Selector mode uses only unassigned fragments unless --reassign is supplied; --dry-run reports matches without changing review state.`)
 }
 
 func groupViewUsage() error {
@@ -1436,9 +1995,16 @@ func groupViewUsage() error {
 Show a group's source fragments and patches.`)
 }
 
+func groupProjectUsage() error {
+	return printUsage(`Usage:
+  git-review group project --name <name>
+
+Create a display-only projection ref for a group's displayable fragments.`)
+}
+
 func groupAcceptUsage() error {
 	return printUsage(`Usage:
-  git-review group accept --name <name> --path <path>
+	git-review group accept --name <name> --path <path> [--path <path>...]
 
-Accept a group's fragments for a path.`)
+Accept a group's fragments for one or more paths.`)
 }
