@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.11\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.11", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.12\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.12", flag, output)
 		}
 	}
 }
@@ -310,6 +310,39 @@ func TestAcceptPathRemovesStaleReviewedPaths(t *testing.T) {
 	runCommand(t, repository, binary, "undo")
 	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("main")+":planning/brandbook/tokens.json"); content != "tokens\n" {
 		t.Fatalf("planning path after undo = %q, want restored content", content)
+	}
+}
+
+func TestAcceptPathReconcilesMergeOnlyDiff(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "before\n"})
+	binary := buildBinary(t)
+	base := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "example.txt", "after\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "change example")
+	runCommand(t, repository, binary, "accept", "--path", "example.txt")
+	writeFile(t, repository, "example.txt", "after,\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	tree := strings.TrimSpace(runCommand(t, repository, "git", "write-tree"))
+	mergeCommit := strings.TrimSpace(runCommand(t, repository, "git", "commit-tree", tree, "-p", "HEAD", "-p", base, "-m", "merge formatting"))
+	runCommand(t, repository, "git", "update-ref", "refs/heads/main", mergeCommit)
+	runCommand(t, repository, "git", "reset", "--hard", mergeCommit)
+	output := runCommand(t, repository, binary, "accept", "--path", "example.txt")
+	var response struct {
+		Reconciled []string `json:"reconciled"`
+	}
+	if err := json.Unmarshal([]byte(output), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Reconciled) != 1 || response.Reconciled[0] != "example.txt" {
+		t.Fatalf("reconciled paths = %#v, want merge-only path", response.Reconciled)
+	}
+	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("main")+":example.txt"); content != "after,\n" {
+		t.Fatalf("reviewed content = %q, want merge-only content", content)
+	}
+	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "example.txt"); err != nil {
+		t.Fatalf("merge-only path still differs from HEAD: %v", err)
 	}
 }
 

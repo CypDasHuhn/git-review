@@ -256,8 +256,10 @@ func (r Repository) CommitSubject(ctx context.Context, ref string) (string, erro
 	return git(ctx, r.Root, "log", "-1", "--format=%s", ref)
 }
 
-func (r Repository) TreePaths(ctx context.Context, ref string) ([]string, error) {
-	output, err := git(ctx, r.Root, "ls-tree", "-r", "--name-only", ref)
+func (r Repository) DiffPaths(ctx context.Context, left, right string, selectors []string) ([]string, error) {
+	args := []string{"diff", "--name-only", "--no-renames", left, right, "--"}
+	args = append(args, selectors...)
+	output, err := git(ctx, r.Root, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +269,7 @@ func (r Repository) TreePaths(ctx context.Context, ref string) ([]string, error)
 	return strings.Split(output, "\n"), nil
 }
 
-func (r Repository) RemovePaths(ctx context.Context, ref string, paths []string, subject string) (string, error) {
+func (r Repository) SyncPaths(ctx context.Context, ref, sourceRef string, paths []string, subject string) (string, error) {
 	head, err := r.ResolveCommit(ctx, ref)
 	if err != nil {
 		return "", err
@@ -285,7 +287,26 @@ func (r Repository) RemovePaths(ctx context.Context, ref string, paths []string,
 		return "", err
 	}
 	for _, path := range paths {
-		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", path); err != nil {
+		data, exists, err := r.treeFile(ctx, sourceRef, path)
+		if err != nil {
+			return "", err
+		}
+		if !exists {
+			if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", path); err != nil {
+				return "", err
+			}
+			continue
+		}
+		blob, err := gitWithInput(ctx, r.Root, env, data, "hash-object", "-w", "--stdin")
+		if err != nil {
+			return "", err
+		}
+		mode, err := r.fileMode(ctx, sourceRef, path)
+		if err != nil {
+			return "", err
+		}
+		cacheInfo := mode + "," + blob + "," + path
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--add", "--cacheinfo", cacheInfo); err != nil {
 			return "", err
 		}
 	}
@@ -856,11 +877,15 @@ func sameLines(left, right []string) bool {
 		return false
 	}
 	for index := range left {
-		if left[index] != right[index] {
+		if !sameLine(left[index], right[index]) {
 			return false
 		}
 	}
 	return true
+}
+
+func sameLine(left, right string) bool {
+	return left == right || strings.TrimSuffix(left, "\r") == strings.TrimSuffix(right, "\r")
 }
 
 func max(left, right int) int {

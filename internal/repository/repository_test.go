@@ -57,6 +57,18 @@ func TestLocateEditFollowsWhitespaceLineDrift(t *testing.T) {
 	}
 }
 
+func TestLocateEditMatchesDifferentLineEndings(t *testing.T) {
+	source := []string{"before\r", "remove\r", "after\r"}
+	current := []string{"before", "remove", "after"}
+	position, matchedLines, err := locateEdit(source, current, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != 1 || matchedLines != 1 {
+		t.Fatalf("location = (%d, %d), want (1, 1)", position, matchedLines)
+	}
+}
+
 func TestLocateEditFollowsInsertedContextBeforeInsertion(t *testing.T) {
 	source := []string{"start", "end"}
 	current := []string{"start", "context", "end"}

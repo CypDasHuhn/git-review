@@ -15,7 +15,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.11"
+const version = "0.4.12"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -355,12 +355,12 @@ func accept(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	reconciled, err := staleReviewedPaths(ctx, repo, state.ReviewedRef, fragments, paths)
+	reconciled, err := reconcilePaths(ctx, repo, state, fragments, paths)
 	if err != nil {
 		return err
 	}
 	if len(reconciled) > 0 {
-		if _, err := repo.RemovePaths(ctx, state.ReviewedRef, reconciled, "accept paths: remove stale reviewed paths"); err != nil {
+		if _, err := repo.SyncPaths(ctx, state.ReviewedRef, "HEAD", reconciled, "accept paths: reconcile reviewed paths"); err != nil {
 			return err
 		}
 		state.MaterializedPathOperations = append(state.MaterializedPathOperations, reconciled)
@@ -1786,47 +1786,31 @@ func includeFragmentDependencies(fragments []session.Fragment, selected map[stri
 	}
 }
 
-func staleReviewedPaths(ctx context.Context, repo repository.Repository, reviewedRef string, fragments []session.Fragment, selectors []string) ([]string, error) {
-	reviewedPaths, err := repo.TreePaths(ctx, reviewedRef)
+func reconcilePaths(ctx context.Context, repo repository.Repository, state session.State, fragments []session.Fragment, selectors []string) ([]string, error) {
+	diffPaths, err := repo.DiffPaths(ctx, state.ReviewedRef, "HEAD", selectors)
 	if err != nil {
 		return nil, err
 	}
-	headPaths, err := repo.TreePaths(ctx, "HEAD")
-	if err != nil {
-		return nil, err
-	}
-	head := make(map[string]bool, len(headPaths))
-	for _, path := range headPaths {
-		head[path] = true
-	}
-	var stale []string
-	for _, path := range reviewedPaths {
-		if head[path] || !matchesAnyPathSelector(path, selectors) {
+	materialized := stringSet(state.MaterializedFragments)
+	seen := map[string]bool{}
+	var reconciled []string
+	for _, path := range diffPaths {
+		if seen[path] {
 			continue
 		}
-		touched := false
+		seen[path] = true
+		blocked := false
 		for _, fragment := range fragments {
-			if fragment.TouchesPath(path) {
-				touched = true
+			if fragment.TouchesPath(path) && !materialized[fragment.ID()] {
+				blocked = true
 				break
 			}
 		}
-		if !touched {
-			stale = append(stale, path)
+		if !blocked {
+			reconciled = append(reconciled, path)
 		}
 	}
-	return stale, nil
-}
-
-func matchesAnyPathSelector(path string, selectors []string) bool {
-	for _, selector := range selectors {
-		selector = strings.TrimSuffix(selector, "/...")
-		selector = strings.TrimSuffix(selector, "/")
-		if path == selector || strings.HasPrefix(path, selector+"/") {
-			return true
-		}
-	}
-	return false
+	return reconciled, nil
 }
 
 func fragmentGroups(groups []session.Group) map[string]string {
