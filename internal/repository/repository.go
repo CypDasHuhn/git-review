@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -185,6 +186,14 @@ func (r Repository) CreateRef(ctx context.Context, ref, commit string) error {
 	return nil
 }
 
+func (r Repository) DeleteRef(ctx context.Context, ref string) error {
+	_, err := git(ctx, r.Root, "update-ref", "-d", ref)
+	if err != nil {
+		return fmt.Errorf("delete ref %q: %w", ref, err)
+	}
+	return nil
+}
+
 func (r Repository) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
 	command := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", ancestor, descendant)
 	command.Dir = r.Root
@@ -329,6 +338,97 @@ func (r Repository) Log(ctx context.Context, ref string) (string, error) {
 }
 
 func (r Repository) ApplyFragment(ctx context.Context, ref string, patch FragmentPatch) (string, error) {
+	if patch.Fragment.OldPath != "" && patch.Fragment.OldPath != patch.Fragment.Path {
+		return r.applyFragmentByLocation(ctx, ref, patch)
+	}
+	commit, err := r.applyFragmentThreeWay(ctx, ref, patch)
+	if err == nil || !strings.Contains(err.Error(), "fragment conflicts with the reviewed state") {
+		return commit, err
+	}
+	return r.applyFragmentByLocation(ctx, ref, patch)
+}
+
+func (r Repository) applyFragmentThreeWay(ctx context.Context, ref string, patch FragmentPatch) (string, error) {
+	head, err := r.ResolveCommit(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	baseData, baseExists, err := r.treeFile(ctx, patch.Fragment.Parent, patch.Fragment.Path)
+	if err != nil {
+		return "", err
+	}
+	selectedData, selectedExists, err := selectedFragmentData(ctx, r, patch, baseData, baseExists)
+	if err != nil {
+		return "", err
+	}
+	currentData, currentExists, err := r.treeFile(ctx, head, patch.Fragment.Path)
+	if err != nil {
+		return "", err
+	}
+	if patch.Fragment.OldLines == 0 {
+		baseLines, _ := splitLines(baseData)
+		if !baseExists {
+			baseLines = nil
+		}
+		currentLines, _ := splitLines(currentData)
+		if !sameLines(baseLines, currentLines) && !fragmentAlreadyApplied(baseLines, currentLines, patch.Fragment.OldStart, 0, patch.NewLines) {
+			if _, _, err := locateEdit(baseLines, currentLines, patch.Fragment.OldStart, 0); err != nil {
+				return "", fmt.Errorf("locate fragment %s: %w", patch.Fragment.Label(), err)
+			}
+		}
+	}
+	mergedData, err := mergeFragmentData(ctx, r.Root, currentData, currentExists, baseData, baseExists, selectedData, selectedExists)
+	if err != nil {
+		return "", fmt.Errorf("merge fragment %s: %w", patch.Fragment.Label(), err)
+	}
+	if sameTreeFile(currentData, currentExists, mergedData, selectedExists) {
+		return head, nil
+	}
+	indexPath, err := temporaryIndex()
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(indexPath)
+	env := map[string]string{"GIT_INDEX_FILE": indexPath}
+	if _, err := gitWithEnv(ctx, r.Root, env, "read-tree", head); err != nil {
+		return "", err
+	}
+	if !selectedExists {
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", patch.Fragment.Path); err != nil {
+			return "", err
+		}
+	} else {
+		blob, err := gitWithInput(ctx, r.Root, env, mergedData, "hash-object", "-w", "--stdin")
+		if err != nil {
+			return "", err
+		}
+		mode, err := r.fileMode(ctx, patch.Fragment.Commit, patch.Fragment.Path)
+		if err != nil {
+			mode, err = r.fileMode(ctx, head, patch.Fragment.Path)
+			if err != nil {
+				return "", err
+			}
+		}
+		cacheInfo := mode + "," + blob + "," + patch.Fragment.Path
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--add", "--cacheinfo", cacheInfo); err != nil {
+			return "", err
+		}
+	}
+	tree, err := gitWithEnv(ctx, r.Root, env, "write-tree")
+	if err != nil {
+		return "", err
+	}
+	commit, err := git(ctx, r.Root, "commit-tree", tree, "-p", head, "-m", "accept "+patch.Fragment.Label())
+	if err != nil {
+		return "", err
+	}
+	if _, err := git(ctx, r.Root, "update-ref", ref, commit, head); err != nil {
+		return "", err
+	}
+	return commit, nil
+}
+
+func (r Repository) applyFragmentByLocation(ctx context.Context, ref string, patch FragmentPatch) (string, error) {
 	head, err := r.ResolveCommit(ctx, ref)
 	if err != nil {
 		return "", err
@@ -441,11 +541,18 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 }
 
 func (r Repository) ApplyReviewFragment(ctx context.Context, ref string, patch FragmentPatch) (string, error) {
+	superseded, supersededErr := r.fragmentSupersededByHead(ctx, ref, patch.Fragment)
+	if supersededErr != nil {
+		return "", supersededErr
+	}
+	if superseded {
+		return r.ResolveCommit(ctx, ref)
+	}
 	commit, err := r.ApplyFragment(ctx, ref, patch)
 	if err == nil || !isMissingEditContext(err) {
 		return commit, err
 	}
-	superseded, supersededErr := r.fragmentSupersededByHead(ctx, ref, patch.Fragment)
+	superseded, supersededErr = r.fragmentSupersededByHead(ctx, ref, patch.Fragment)
 	if supersededErr != nil {
 		return "", supersededErr
 	}
@@ -453,6 +560,133 @@ func (r Repository) ApplyReviewFragment(ctx context.Context, ref string, patch F
 		return "", err
 	}
 	return r.ResolveCommit(ctx, ref)
+}
+
+func selectedFragmentData(ctx context.Context, repo Repository, patch FragmentPatch, baseData []byte, baseExists bool) ([]byte, bool, error) {
+	baseLines, trailingNewline := splitLines(baseData)
+	if !baseExists {
+		baseLines = nil
+		trailingNewline = true
+	}
+	position := patch.Fragment.OldStart - 1
+	if patch.Fragment.OldLines == 0 {
+		position = patch.Fragment.OldStart
+	}
+	if position < 0 || position > len(baseLines) || position+patch.Fragment.OldLines > len(baseLines) {
+		return nil, false, errors.New("fragment source range is invalid in its commit parent")
+	}
+	if patch.Fragment.OldLines > 0 && !sameLines(baseLines[position:position+patch.Fragment.OldLines], patch.OldLines) {
+		return nil, false, errors.New("fragment source content differs from its commit parent")
+	}
+	targetData, targetExists, err := repo.treeFile(ctx, patch.Fragment.Commit, patch.Fragment.Path)
+	if err != nil {
+		return nil, false, err
+	}
+	if !targetExists {
+		return nil, false, nil
+	}
+	updated := make([]string, 0, len(baseLines)-patch.Fragment.OldLines+len(patch.NewLines))
+	updated = append(updated, baseLines[:position]...)
+	updated = append(updated, patch.NewLines...)
+	updated = append(updated, baseLines[position+patch.Fragment.OldLines:]...)
+	targetLines, targetNewline := splitLines(targetData)
+	if patch.Fragment.NewLines > 0 && patch.Fragment.NewStart-1+patch.Fragment.NewLines >= len(targetLines) {
+		trailingNewline = targetNewline
+	}
+	return joinLines(updated, trailingNewline), true, nil
+}
+
+func mergeFragmentData(ctx context.Context, directory string, currentData []byte, currentExists bool, baseData []byte, baseExists bool, selectedData []byte, selectedExists bool) ([]byte, error) {
+	preferredLineEnding := "\n"
+	for _, data := range [][]byte{currentData, baseData, selectedData} {
+		if bytes.Contains(data, []byte("\r\n")) {
+			preferredLineEnding = "\r\n"
+			break
+		}
+	}
+	currentPath, err := writeMergeFile(normalizeMergeData(currentData, currentExists))
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(currentPath)
+	basePath, err := writeMergeFile(normalizeMergeData(baseData, baseExists))
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(basePath)
+	selectedPath, err := writeMergeFile(normalizeMergeData(selectedData, selectedExists))
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(selectedPath)
+	command := exec.CommandContext(ctx, "git", "merge-file", "--diff3", currentPath, basePath, selectedPath)
+	command.Dir = directory
+	output, err := command.CombinedOutput()
+	if err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+			return nil, errors.New("fragment conflicts with the reviewed state")
+		}
+		return nil, fmt.Errorf("git merge-file: %s", strings.TrimSpace(string(output)))
+	}
+	merged, err := os.ReadFile(currentPath)
+	if err != nil {
+		return nil, err
+	}
+	return restoreMergeLineEndings(merged, preferredLineEnding), nil
+}
+
+func normalizeMergeData(data []byte, exists bool) []byte {
+	if !exists {
+		return []byte{}
+	}
+	lines, trailingNewline := splitLines(data)
+	for index := range lines {
+		lines[index] = strings.TrimSuffix(lines[index], "\r")
+	}
+	return joinLines(lines, trailingNewline)
+}
+
+func restoreMergeLineEndings(data []byte, lineEnding string) []byte {
+	lines, trailingNewline := splitLines(data)
+	for index := range lines {
+		lines[index] = strings.TrimSuffix(lines[index], "\r")
+	}
+	text := strings.Join(lines, lineEnding)
+	if trailingNewline {
+		text += lineEnding
+	}
+	return []byte(text)
+}
+
+func writeMergeFile(data []byte) (string, error) {
+	file, err := os.CreateTemp("", "git-review-merge-*")
+	if err != nil {
+		return "", fmt.Errorf("create merge input: %w", err)
+	}
+	path := file.Name()
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("write merge input: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("close merge input: %w", err)
+	}
+	return path, nil
+}
+
+func sameTreeFile(currentData []byte, currentExists bool, targetData []byte, targetExists bool) bool {
+	if currentExists != targetExists {
+		return false
+	}
+	if !currentExists {
+		return true
+	}
+	currentLines, _ := splitLines(currentData)
+	targetLines, _ := splitLines(targetData)
+	return sameLines(currentLines, targetLines)
 }
 
 func isRenameOnly(fragment session.Fragment) bool {
@@ -629,6 +863,24 @@ func fragmentSupersededByHead(currentData []byte, currentExists bool, targetData
 }
 
 func (r Repository) fragmentSupersededByHead(ctx context.Context, ref string, fragment session.Fragment) (bool, error) {
+	if fragment.OldPath != "" && fragment.OldPath != fragment.Path {
+		_, oldExists, err := r.treeFile(ctx, ref, fragment.OldPath)
+		if err != nil {
+			return false, err
+		}
+		targetData, targetExists, err := r.treeFile(ctx, ref, fragment.Path)
+		if err != nil {
+			return false, err
+		}
+		finalData, finalExists, err := r.treeFile(ctx, "HEAD", fragment.Path)
+		if err != nil {
+			return false, err
+		}
+		if !finalExists {
+			return !oldExists && !targetExists, nil
+		}
+		return targetExists && !oldExists && fragmentSupersededByHead(targetData, true, finalData, true), nil
+	}
 	currentData, currentExists, err := r.treeFile(ctx, ref, fragment.Path)
 	if err != nil {
 		return false, err
@@ -642,6 +894,9 @@ func (r Repository) fragmentSupersededByHead(ctx context.Context, ref string, fr
 	finalData, finalExists, err := r.treeFile(ctx, "HEAD", fragment.Path)
 	if err != nil {
 		return false, err
+	}
+	if !finalExists {
+		return !currentExists, nil
 	}
 	return fragmentSupersededByHead(currentData, currentExists, finalData, finalExists), nil
 }

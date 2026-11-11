@@ -10,12 +10,13 @@ import (
 	pathpkg "path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/CypDasHuhn/git-review/internal/repository"
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.14"
+const version = "0.4.15"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -348,11 +349,11 @@ func accept(ctx context.Context, args []string) error {
 	}
 	state.AcceptedFragments = appendUnique(state.AcceptedFragments, newlyAccepted...)
 	store := session.NewStore(repo.GitDir)
-	if err := store.Save(state); err != nil {
+	materialized, err := materializeAccepted(ctx, repo, &state, fragments)
+	if err != nil {
 		return err
 	}
-	materialized, err := materializeAccepted(ctx, repo, &state, store, fragments)
-	if err != nil {
+	if err := store.Save(state); err != nil {
 		return err
 	}
 	reconciled, err := reconcilePaths(ctx, repo, state, fragments, paths)
@@ -732,15 +733,15 @@ func acceptGroup(ctx context.Context, args []string) error {
 		}
 	}
 	state.AcceptedFragments = appendUnique(state.AcceptedFragments, newlyAccepted...)
-	if err := store.Save(state); err != nil {
-		return err
-	}
 	fragments, err := allFragments(ctx, repo, state)
 	if err != nil {
 		return err
 	}
-	materialized, err := materializeAccepted(ctx, repo, &state, store, fragments)
+	materialized, err := materializeAccepted(ctx, repo, &state, fragments)
 	if err != nil {
+		return err
+	}
+	if err := store.Save(state); err != nil {
 		return err
 	}
 	pending := pendingFragmentIDs(state)
@@ -1686,7 +1687,16 @@ func validateGroupGraph(ctx context.Context, repo repository.Repository, state s
 	return nil
 }
 
-func materializeAccepted(ctx context.Context, repo repository.Repository, state *session.State, store session.Store, fragments []session.Fragment) ([]string, error) {
+func materializeAccepted(ctx context.Context, repo repository.Repository, state *session.State, fragments []session.Fragment) ([]string, error) {
+	originalHead, err := repo.ResolveCommit(ctx, state.ReviewedRef)
+	if err != nil {
+		return nil, err
+	}
+	transactionRef := fmt.Sprintf("%s-transaction-%d", state.ReviewedRef, time.Now().UnixNano())
+	if err := repo.CreateRef(ctx, transactionRef, originalHead); err != nil {
+		return nil, err
+	}
+	defer repo.DeleteRef(context.Background(), transactionRef)
 	dependencies := fragmentDependencies(fragments)
 	accepted := stringSet(state.AcceptedFragments)
 	materialized := stringSet(state.MaterializedFragments)
@@ -1702,21 +1712,27 @@ func materializeAccepted(ctx context.Context, repo repository.Repository, state 
 			if err != nil {
 				return applied, err
 			}
-			if _, err := repo.ApplyReviewFragment(ctx, state.ReviewedRef, patch); err != nil {
+			if _, err := repo.ApplyReviewFragment(ctx, transactionRef, patch); err != nil {
 				return applied, err
 			}
 			materialized[id] = true
-			state.MaterializedFragments = append(state.MaterializedFragments, id)
 			applied = append(applied, id)
-			if err := store.Save(*state); err != nil {
-				return applied, err
-			}
 			progress = true
 		}
 		if !progress {
 			break
 		}
 	}
+	finalHead, err := repo.ResolveCommit(ctx, transactionRef)
+	if err != nil {
+		return applied, err
+	}
+	if finalHead != originalHead {
+		if err := repo.ResetRef(ctx, state.ReviewedRef, finalHead); err != nil {
+			return applied, err
+		}
+	}
+	state.MaterializedFragments = appendUnique(state.MaterializedFragments, applied...)
 	return applied, nil
 }
 

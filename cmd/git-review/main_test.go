@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.14\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.14", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.15\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.15", flag, output)
 		}
 	}
 }
@@ -847,20 +847,49 @@ func TestFragmentMaterializationRejectsAmbiguousDrift(t *testing.T) {
 	assignFragment(t, repository, binary, "top", top)
 	assignFragment(t, repository, binary, "target", target)
 	runCommand(t, repository, binary, "group", "accept", "--name", "top", "--path", "example.txt")
+	beforeRejectedAcceptance := readStatus(t, repository, binary)
 	output, err := runCommandError(t, repository, binary, "group", "accept", "--name", "target", "--path", "example.txt")
 	if err == nil || !strings.Contains(output, "ambiguous") {
 		t.Fatalf("ambiguous materialization output = %q, err = %v", output, err)
 	}
 	status := readStatus(t, repository, binary)
-	if status.AcceptedCount != 2 || status.MaterializedCount != 1 || status.PendingCount != 1 {
-		t.Fatalf("status after ambiguous materialization = %#v", status)
+	if status.ReviewedCommit != beforeRejectedAcceptance.ReviewedCommit {
+		t.Fatalf("reviewed ref advanced after rejected materialization from %s to %s", beforeRejectedAcceptance.ReviewedCommit, status.ReviewedCommit)
+	}
+	if status.AcceptedCount != 1 || status.MaterializedCount != 1 || status.PendingCount != 0 {
+		t.Fatalf("status after rejected materialization = %#v", status)
 	}
 	var groups []groupStatus
 	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "list", "--json")), &groups); err != nil {
 		t.Fatal(err)
 	}
-	if len(groups) != 2 || groups[1].Fragments[0].Status != "accepted-pending" {
+	if len(groups) != 2 || groups[1].Fragments[0].Status != "pending" {
 		t.Fatalf("groups after ambiguous materialization = %#v", groups)
+	}
+}
+
+func TestGroupAcceptanceRollsBackEarlierFragmentsOnFailure(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "a\nb\na\nb\na\nb\na\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	initialReviewed := readStatus(t, repository, binary).ReviewedCommit
+	writeFile(t, repository, "example.txt", "top\na\nb\ntarget\na\nb\na\nb\na\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "ambiguous insertions")
+	fragments := readChanges(t, repository, binary)
+	if len(fragments) != 2 {
+		t.Fatalf("fragments = %#v, want two insertions", fragments)
+	}
+	for _, fragment := range fragments {
+		assignFragment(t, repository, binary, "all", fragment)
+	}
+	output, err := runCommandError(t, repository, binary, "group", "accept", "--name", "all", "--path", "example.txt")
+	if err == nil || !strings.Contains(output, "ambiguous") {
+		t.Fatalf("ambiguous group acceptance output = %q, err = %v", output, err)
+	}
+	status := readStatus(t, repository, binary)
+	if status.ReviewedCommit != initialReviewed || status.AcceptedCount != 0 || status.MaterializedCount != 0 {
+		t.Fatalf("status after rolled back group acceptance = %#v", status)
 	}
 }
 
@@ -958,6 +987,36 @@ func TestOutOfOrderAcceptanceSkipsSupersededFragment(t *testing.T) {
 	}
 	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "example.txt"); err != nil {
 		t.Fatalf("reviewed superseded path still differs from HEAD: %v", err)
+	}
+}
+
+func TestGroupAcceptMaterializesFragmentsFromSameCommitWithoutDrift(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "A\nB\nC\nD\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "example.txt", "B\nA\nC\nD\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "reorder lines")
+	commit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	fragments := readChanges(t, repository, binary)
+	if len(fragments) != 2 {
+		t.Fatalf("fragments = %#v, want two fragments from one commit", fragments)
+	}
+	for _, fragment := range fragments {
+		if fragment.Commit != commit {
+			t.Fatalf("fragment commit = %q, want %q", fragment.Commit, commit)
+		}
+	}
+	for _, fragment := range fragments {
+		assignFragment(t, repository, binary, "reorder", fragment)
+	}
+	runCommand(t, repository, binary, "group", "accept", "--name", "reorder", "--path", "example.txt")
+	status := readStatus(t, repository, binary)
+	if status.AcceptedCount != 2 || status.MaterializedCount != 2 || status.PendingCount != 0 {
+		t.Fatalf("status after same-commit fragment acceptance = %#v", status)
+	}
+	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "example.txt"); err != nil {
+		t.Fatalf("reviewed same-commit fragments still differ from HEAD: %v", err)
 	}
 }
 
