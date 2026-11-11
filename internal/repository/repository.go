@@ -261,6 +261,9 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 	if err != nil {
 		return "", err
 	}
+	if isRenameOnly(patch.Fragment) {
+		return r.applyRenameOnly(ctx, ref, head, patch)
+	}
 	sourcePath := patch.Fragment.Path
 	if patch.Fragment.OldPath != "" {
 		sourcePath = patch.Fragment.OldPath
@@ -350,6 +353,67 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--add", "--cacheinfo", cacheInfo); err != nil {
 			return "", err
 		}
+	}
+	tree, err := gitWithEnv(ctx, r.Root, env, "write-tree")
+	if err != nil {
+		return "", err
+	}
+	commit, err := git(ctx, r.Root, "commit-tree", tree, "-p", head, "-m", "accept "+patch.Fragment.Label())
+	if err != nil {
+		return "", err
+	}
+	if _, err := git(ctx, r.Root, "update-ref", ref, commit, head); err != nil {
+		return "", err
+	}
+	return commit, nil
+}
+
+func isRenameOnly(fragment session.Fragment) bool {
+	return fragment.OldPath != "" && fragment.OldPath != fragment.Path && fragment.OldLines == 0 && fragment.NewLines == 0
+}
+
+func (r Repository) applyRenameOnly(ctx context.Context, ref, head string, patch FragmentPatch) (string, error) {
+	_, oldExists, err := r.treeFile(ctx, head, patch.Fragment.OldPath)
+	if err != nil {
+		return "", err
+	}
+	_, targetExists, err := r.treeFile(ctx, head, patch.Fragment.Path)
+	if err != nil {
+		return "", err
+	}
+	if targetExists && !oldExists {
+		return head, nil
+	}
+	targetData, targetExists, err := r.treeFile(ctx, patch.Fragment.Commit, patch.Fragment.Path)
+	if err != nil {
+		return "", err
+	}
+	if !targetExists {
+		return "", fmt.Errorf("rename target %q does not exist in %s", patch.Fragment.Path, patch.Fragment.Commit)
+	}
+	indexPath, err := temporaryIndex()
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(indexPath)
+	env := map[string]string{"GIT_INDEX_FILE": indexPath}
+	if _, err := gitWithEnv(ctx, r.Root, env, "read-tree", head); err != nil {
+		return "", err
+	}
+	if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", patch.Fragment.OldPath); err != nil {
+		return "", err
+	}
+	blob, err := gitWithInput(ctx, r.Root, env, targetData, "hash-object", "-w", "--stdin")
+	if err != nil {
+		return "", err
+	}
+	mode, err := r.fileMode(ctx, patch.Fragment.Commit, patch.Fragment.Path)
+	if err != nil {
+		return "", err
+	}
+	cacheInfo := mode + "," + blob + "," + patch.Fragment.Path
+	if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--add", "--cacheinfo", cacheInfo); err != nil {
+		return "", err
 	}
 	tree, err := gitWithEnv(ctx, r.Root, env, "write-tree")
 	if err != nil {
