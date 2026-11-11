@@ -408,9 +408,20 @@ func parseFragmentPatches(output, commit, parent, shortCommit string) []Fragment
 	path := ""
 	oldPath := ""
 	header := ""
+	hasHunk := false
 	var lines []string
 	flush := func() {
-		if header == "" || path == "" {
+		if header == "" {
+			if !hasHunk && path != "" && oldPath != "" && path != oldPath {
+				patches = append(patches, FragmentPatch{Fragment: session.Fragment{
+					Commit: commit, ShortCommit: shortCommit, Parent: parent, Path: path, OldPath: oldPath,
+				}})
+			}
+			return
+		}
+		if path == "" {
+			header = ""
+			lines = nil
 			return
 		}
 		oldStart, oldLines, newStart, newLines, ok := parseHunkHeader(header)
@@ -439,6 +450,7 @@ func parseFragmentPatches(output, commit, parent, shortCommit string) []Fragment
 			OldLines: oldContent,
 			NewLines: newContent,
 		})
+		hasHunk = true
 		header = ""
 		lines = nil
 	}
@@ -447,6 +459,7 @@ func parseFragmentPatches(output, commit, parent, shortCommit string) []Fragment
 			flush()
 			path = ""
 			oldPath = ""
+			hasHunk = false
 			continue
 		}
 		if strings.HasPrefix(line, "@@ ") {
@@ -472,6 +485,14 @@ func parseFragmentPatches(output, commit, parent, shortCommit string) []Fragment
 			} else {
 				path = newPath
 			}
+			continue
+		}
+		if strings.HasPrefix(line, "rename from ") {
+			oldPath = diffPath(line[len("rename from "):], "")
+			continue
+		}
+		if strings.HasPrefix(line, "rename to ") {
+			path = diffPath(line[len("rename to "):], "")
 		}
 	}
 	flush()
@@ -483,7 +504,13 @@ func diffPath(value, prefix string) string {
 	if value == "/dev/null" {
 		return ""
 	}
-	return strings.TrimPrefix(value, prefix)
+	value = strings.TrimPrefix(value, prefix)
+	if strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"") {
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			return unquoted
+		}
+	}
+	return value
 }
 
 func splitLines(data []byte) ([]string, bool) {

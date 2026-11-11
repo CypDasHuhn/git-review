@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.7\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.7", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.8\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.8", flag, output)
 		}
 	}
 }
@@ -169,6 +169,32 @@ func TestAcceptOutputsEmptyListsAsArrays(t *testing.T) {
 		if err := json.Unmarshal(raw, &values); err != nil {
 			t.Fatalf("%s = %q is not a string array: %v", field, raw, err)
 		}
+	}
+}
+
+func TestAcceptMaterializesRenameOnlyFragment(t *testing.T) {
+	repository := newRepository(t, map[string]string{"Brandbook/tokens.json": "tokens\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	if err := os.MkdirAll(filepath.Join(repository, "planning", "brandbook"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "mv", "Brandbook/tokens.json", "planning/brandbook/tokens.json")
+	runCommand(t, repository, "git", "commit", "-m", "move brandbook")
+	fragments := readChanges(t, repository, binary)
+	if len(fragments) != 1 || fragments[0].OldPath != "Brandbook/tokens.json" || fragments[0].Path != "planning/brandbook/tokens.json" {
+		t.Fatalf("fragments = %#v, want rename fragment", fragments)
+	}
+	runCommand(t, repository, binary, "accept", "--path", "planning/brandbook/tokens.json")
+	status := readStatus(t, repository, binary)
+	if status.AcceptedCount != 1 || status.MaterializedCount != 1 || status.PendingCount != 0 {
+		t.Fatalf("status after rename acceptance = %#v, want materialized rename", status)
+	}
+	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("main")+":planning/brandbook/tokens.json"); content != "tokens\n" {
+		t.Fatalf("reviewed renamed content = %q", content)
+	}
+	if _, err := runCommandError(t, repository, "git", "cat-file", "-e", session.ReviewedRef("main")+":Brandbook/tokens.json"); err == nil {
+		t.Fatal("old renamed path still exists in reviewed state")
 	}
 }
 

@@ -2,6 +2,21 @@ package repository
 
 import "testing"
 
+func TestParseFragmentPatchesIncludesRenameOnlyChanges(t *testing.T) {
+	output := "diff --git a/Brandbook/tokens.json b/planning/brandbook/tokens.json\n" +
+		"similarity index 100%\n" +
+		"rename from Brandbook/tokens.json\n" +
+		"rename to planning/brandbook/tokens.json\n"
+	patches := parseFragmentPatches(output, "commit", "parent", "short")
+	if len(patches) != 1 {
+		t.Fatalf("patches = %#v, want one rename", patches)
+	}
+	fragment := patches[0].Fragment
+	if fragment.Path != "planning/brandbook/tokens.json" || fragment.OldPath != "Brandbook/tokens.json" || fragment.OldLines != 0 || fragment.NewLines != 0 {
+		t.Fatalf("fragment = %#v, want rename-only fragment", fragment)
+	}
+}
+
 func TestLocateEditFollowsShiftedSourceLines(t *testing.T) {
 	source := []string{"one", "two", "three", "four"}
 	current := []string{"zero", "one", "two", "three", "four"}

@@ -15,7 +15,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.7"
+const version = "0.4.8"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -1509,6 +1509,9 @@ func printCounts(counts map[string]int) {
 }
 
 func formatFragmentPatch(patch repository.FragmentPatch) string {
+	if patch.Fragment.OldPath != "" && patch.Fragment.OldPath != patch.Fragment.Path && len(patch.OldLines) == 0 && len(patch.NewLines) == 0 {
+		return fmt.Sprintf("rename %s -> %s\n", patch.Fragment.OldPath, patch.Fragment.Path)
+	}
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "@@ -%d,%d +%d,%d @@\n", patch.Fragment.OldStart, patch.Fragment.OldLines, patch.Fragment.NewStart, patch.Fragment.NewLines)
 	for _, line := range patch.OldLines {
