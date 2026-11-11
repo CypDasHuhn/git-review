@@ -14,14 +14,15 @@ import (
 var ErrNotFound = errors.New("review session not found")
 
 type State struct {
-	WorkBranch             string   `json:"workBranch"`
-	ComparisonRef          string   `json:"comparisonRef"`
-	PinnedComparisonCommit string   `json:"pinnedComparisonCommit"`
-	InitialReviewedCommit  string   `json:"initialReviewedCommit"`
-	ReviewedRef            string   `json:"reviewedRef"`
-	StartedFromWorkCommit  string   `json:"startedFromWorkCommit"`
-	AcceptedFragments      []string `json:"acceptedFragments,omitempty"`
-	MaterializedFragments  []string `json:"materializedFragments,omitempty"`
+	WorkBranch                 string     `json:"workBranch"`
+	ComparisonRef              string     `json:"comparisonRef"`
+	PinnedComparisonCommit     string     `json:"pinnedComparisonCommit"`
+	InitialReviewedCommit      string     `json:"initialReviewedCommit"`
+	ReviewedRef                string     `json:"reviewedRef"`
+	StartedFromWorkCommit      string     `json:"startedFromWorkCommit"`
+	AcceptedFragments          []string   `json:"acceptedFragments,omitempty"`
+	MaterializedFragments      []string   `json:"materializedFragments,omitempty"`
+	MaterializedPathOperations [][]string `json:"materializedPathOperations,omitempty"`
 }
 
 type Status struct {

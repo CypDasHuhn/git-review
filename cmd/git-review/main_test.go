@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.10\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.10", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.11\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.11", flag, output)
 		}
 	}
 }
@@ -275,6 +275,41 @@ func TestAcceptPathIncludesRenameHistory(t *testing.T) {
 	}
 	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "docs/ENTRA_EXTERNAL_ID_SETUP.md"); err != nil {
 		t.Fatalf("reviewed rename still differs from HEAD: %v", err)
+	}
+}
+
+func TestAcceptPathRemovesStaleReviewedPaths(t *testing.T) {
+	repository := newRepository(t, map[string]string{"README.md": "initial\n"})
+	binary := buildBinary(t)
+	base := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "planning/brandbook/tokens.json", "tokens\n")
+	runCommand(t, repository, "git", "add", "planning/brandbook/tokens.json")
+	runCommand(t, repository, "git", "commit", "-m", "add planning brandbook")
+	runCommand(t, repository, binary, "accept", "--path", "planning/brandbook")
+	runCommand(t, repository, "git", "reset", "--hard", base)
+	writeFile(t, repository, "docs/brandbook/tokens.json", "tokens\n")
+	runCommand(t, repository, "git", "add", "docs/brandbook/tokens.json")
+	runCommand(t, repository, "git", "commit", "-m", "rewrite docs location")
+	output := runCommand(t, repository, binary, "accept", "--path", "planning/brandbook")
+	var response struct {
+		Reconciled []string `json:"reconciled"`
+	}
+	if err := json.Unmarshal([]byte(output), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Reconciled) != 1 || response.Reconciled[0] != "planning/brandbook/tokens.json" {
+		t.Fatalf("reconciled paths = %#v, want stale planning path", response.Reconciled)
+	}
+	if _, err := runCommandError(t, repository, "git", "cat-file", "-e", session.ReviewedRef("main")+":planning/brandbook/tokens.json"); err == nil {
+		t.Fatal("stale planning path still exists in reviewed state")
+	}
+	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "planning/brandbook"); err != nil {
+		t.Fatalf("stale planning path still differs from HEAD: %v", err)
+	}
+	runCommand(t, repository, binary, "undo")
+	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("main")+":planning/brandbook/tokens.json"); content != "tokens\n" {
+		t.Fatalf("planning path after undo = %q, want restored content", content)
 	}
 }
 

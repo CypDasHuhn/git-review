@@ -252,6 +252,57 @@ func (r Repository) ResetRef(ctx context.Context, ref, commit string) error {
 	return nil
 }
 
+func (r Repository) CommitSubject(ctx context.Context, ref string) (string, error) {
+	return git(ctx, r.Root, "log", "-1", "--format=%s", ref)
+}
+
+func (r Repository) TreePaths(ctx context.Context, ref string) ([]string, error) {
+	output, err := git(ctx, r.Root, "ls-tree", "-r", "--name-only", ref)
+	if err != nil {
+		return nil, err
+	}
+	if output == "" {
+		return []string{}, nil
+	}
+	return strings.Split(output, "\n"), nil
+}
+
+func (r Repository) RemovePaths(ctx context.Context, ref string, paths []string, subject string) (string, error) {
+	head, err := r.ResolveCommit(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	if len(paths) == 0 {
+		return head, nil
+	}
+	indexPath, err := temporaryIndex()
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(indexPath)
+	env := map[string]string{"GIT_INDEX_FILE": indexPath}
+	if _, err := gitWithEnv(ctx, r.Root, env, "read-tree", head); err != nil {
+		return "", err
+	}
+	for _, path := range paths {
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", path); err != nil {
+			return "", err
+		}
+	}
+	tree, err := gitWithEnv(ctx, r.Root, env, "write-tree")
+	if err != nil {
+		return "", err
+	}
+	commit, err := git(ctx, r.Root, "commit-tree", tree, "-p", head, "-m", subject)
+	if err != nil {
+		return "", err
+	}
+	if _, err := git(ctx, r.Root, "update-ref", ref, commit, head); err != nil {
+		return "", err
+	}
+	return commit, nil
+}
+
 func (r Repository) Log(ctx context.Context, ref string) (string, error) {
 	return git(ctx, r.Root, "log", "--format=%H%x09%h%x09%cr%x09%s", ref)
 }

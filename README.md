@@ -43,6 +43,8 @@ Review units are immutable fragments from a specific commit diff. A fragment is 
 
 `accept --path` follows selected files through earlier fragment history, so accepting a renamed file also includes the prerequisite fragments from its old path.
 
+It also reconciles selected stale paths that remain only in the reviewed state after a commit rewrite.
+
 Group path filters accept exact files, directories, and `directory/...` recursive patterns.
 
 `fragment inspect` lists the immutable fragments produced by a commit and gives each one a stable full ID plus a short ID. Those IDs can be assigned later with `group assign --fragment`. `fragment list --unassigned --json` reports review fragments that do not belong to a group.

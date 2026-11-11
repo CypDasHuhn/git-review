@@ -15,7 +15,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.10"
+const version = "0.4.11"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -355,11 +355,25 @@ func accept(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	reconciled, err := staleReviewedPaths(ctx, repo, state.ReviewedRef, fragments, paths)
+	if err != nil {
+		return err
+	}
+	if len(reconciled) > 0 {
+		if _, err := repo.RemovePaths(ctx, state.ReviewedRef, reconciled, "accept paths: remove stale reviewed paths"); err != nil {
+			return err
+		}
+		state.MaterializedPathOperations = append(state.MaterializedPathOperations, reconciled)
+		if err := store.Save(state); err != nil {
+			return err
+		}
+	}
 	pending := pendingFragmentIDs(state)
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{
 		"accepted":     nonNilStrings(state.AcceptedFragments),
 		"materialized": nonNilStrings(materialized),
 		"pending":      nonNilStrings(pending),
+		"reconciled":   nonNilStrings(reconciled),
 	})
 }
 
@@ -370,6 +384,27 @@ func undo(ctx context.Context, args []string) error {
 	repo, state, err := currentSession(ctx)
 	if err != nil {
 		return err
+	}
+	if len(state.MaterializedPathOperations) > 0 {
+		subject, err := repo.CommitSubject(ctx, state.ReviewedRef)
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(subject, "accept paths:") {
+			undone, subject, err := repo.UndoAcceptance(ctx, state.ReviewedRef)
+			if err != nil {
+				return err
+			}
+			if !undone {
+				return errors.New("reviewed state history does not contain a materialized path operation")
+			}
+			state.MaterializedPathOperations = state.MaterializedPathOperations[:len(state.MaterializedPathOperations)-1]
+			if err := session.NewStore(repo.GitDir).Save(state); err != nil {
+				return err
+			}
+			fmt.Printf("Un-accepted %s\n", subject)
+			return nil
+		}
 	}
 	accepted := stringSet(state.AcceptedFragments)
 	if len(state.AcceptedFragments) > 0 {
@@ -448,6 +483,7 @@ func reset(ctx context.Context, args []string) error {
 	}
 	state.AcceptedFragments = nil
 	state.MaterializedFragments = nil
+	state.MaterializedPathOperations = nil
 	if err := session.NewStore(repo.GitDir).Save(state); err != nil {
 		return err
 	}
@@ -1748,6 +1784,49 @@ func includeFragmentDependencies(fragments []session.Fragment, selected map[stri
 			return
 		}
 	}
+}
+
+func staleReviewedPaths(ctx context.Context, repo repository.Repository, reviewedRef string, fragments []session.Fragment, selectors []string) ([]string, error) {
+	reviewedPaths, err := repo.TreePaths(ctx, reviewedRef)
+	if err != nil {
+		return nil, err
+	}
+	headPaths, err := repo.TreePaths(ctx, "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	head := make(map[string]bool, len(headPaths))
+	for _, path := range headPaths {
+		head[path] = true
+	}
+	var stale []string
+	for _, path := range reviewedPaths {
+		if head[path] || !matchesAnyPathSelector(path, selectors) {
+			continue
+		}
+		touched := false
+		for _, fragment := range fragments {
+			if fragment.TouchesPath(path) {
+				touched = true
+				break
+			}
+		}
+		if !touched {
+			stale = append(stale, path)
+		}
+	}
+	return stale, nil
+}
+
+func matchesAnyPathSelector(path string, selectors []string) bool {
+	for _, selector := range selectors {
+		selector = strings.TrimSuffix(selector, "/...")
+		selector = strings.TrimSuffix(selector, "/")
+		if path == selector || strings.HasPrefix(path, selector+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func fragmentGroups(groups []session.Group) map[string]string {
