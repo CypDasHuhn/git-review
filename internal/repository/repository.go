@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -440,6 +441,21 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 	return commit, nil
 }
 
+func (r Repository) ApplyReviewFragment(ctx context.Context, ref string, patch FragmentPatch) (string, error) {
+	commit, err := r.ApplyFragment(ctx, ref, patch)
+	if err == nil || !isMissingEditContext(err) {
+		return commit, err
+	}
+	superseded, supersededErr := r.fragmentSupersededByHead(ctx, ref, patch.Fragment)
+	if supersededErr != nil {
+		return "", supersededErr
+	}
+	if !superseded {
+		return "", err
+	}
+	return r.ResolveCommit(ctx, ref)
+}
+
 func isRenameOnly(fragment session.Fragment) bool {
 	return fragment.OldPath != "" && fragment.OldPath != fragment.Path && fragment.OldLines == 0 && fragment.NewLines == 0
 }
@@ -514,6 +530,31 @@ func fragmentAlreadyApplied(current, newLines []string) bool {
 		return true
 	}
 	return len(normalizedSequencePositions(current, newLines)) == 1
+}
+
+func fragmentSupersededByHead(currentData []byte, currentExists bool, targetData []byte, targetExists bool) bool {
+	if !targetExists {
+		return true
+	}
+	return currentExists && bytes.Equal(currentData, targetData)
+}
+
+func (r Repository) fragmentSupersededByHead(ctx context.Context, ref string, fragment session.Fragment) (bool, error) {
+	currentData, currentExists, err := r.treeFile(ctx, ref, fragment.Path)
+	if err != nil {
+		return false, err
+	}
+	if !currentExists && fragment.OldPath != "" && fragment.OldPath != fragment.Path {
+		currentData, currentExists, err = r.treeFile(ctx, ref, fragment.OldPath)
+		if err != nil {
+			return false, err
+		}
+	}
+	finalData, finalExists, err := r.treeFile(ctx, "HEAD", fragment.Path)
+	if err != nil {
+		return false, err
+	}
+	return fragmentSupersededByHead(currentData, currentExists, finalData, finalExists), nil
 }
 
 func (r Repository) treeFile(ctx context.Context, ref, path string) ([]byte, bool, error) {
@@ -692,6 +733,10 @@ func locateEdit(source, current []string, start, count int) (int, int, error) {
 	if count > 0 {
 		candidates := sequencePositions(current, old)
 		if len(candidates) == 0 {
+			tokenCandidates := tokenSequencePositions(current, old)
+			if len(tokenCandidates) == 1 {
+				return tokenCandidates[0].start, tokenCandidates[0].end - tokenCandidates[0].start, nil
+			}
 			normalized := normalizedSequencePositions(current, old)
 			if len(normalized) == 1 {
 				return normalized[0].start, normalized[0].end - normalized[0].start, nil
@@ -765,6 +810,43 @@ func normalizedSequencePositions(lines, sequence []string) []lineRange {
 			}
 			if len(value) >= len(target) {
 				break
+			}
+		}
+	}
+	return positions
+}
+
+func tokenSequencePositions(lines, sequence []string) []lineRange {
+	target := strings.Fields(strings.Join(sequence, " "))
+	if len(target) == 0 {
+		return nil
+	}
+	type token struct {
+		value string
+		line  int
+	}
+	var current []token
+	for line, value := range lines {
+		for _, item := range strings.Fields(value) {
+			current = append(current, token{value: item, line: line})
+		}
+	}
+	var positions []lineRange
+	for start := 0; start+len(target) <= len(current); start++ {
+		matched := true
+		for offset, value := range target {
+			if current[start+offset].value != value {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			position := lineRange{start: current[start].line, end: current[start+len(target)-1].line + 1}
+			if strings.Join(strings.Fields(strings.Join(lines[position.start:position.end], " ")), " ") != strings.Join(target, " ") {
+				continue
+			}
+			if len(positions) == 0 || positions[len(positions)-1] != position {
+				positions = append(positions, position)
 			}
 		}
 	}

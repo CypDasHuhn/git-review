@@ -69,6 +69,30 @@ func TestLocateEditMatchesDifferentLineEndings(t *testing.T) {
 	}
 }
 
+func TestLocateEditFollowsLineBoundaryDrift(t *testing.T) {
+	source := []string{"if (value) return value;", "after"}
+	current := []string{"if (value)", "return value;", "after"}
+	position, matchedLines, err := locateEdit(source, current, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != 0 || matchedLines != 2 {
+		t.Fatalf("location = (%d, %d), want (0, 2)", position, matchedLines)
+	}
+}
+
+func TestFragmentSupersededByHead(t *testing.T) {
+	if !fragmentSupersededByHead([]byte("reviewed"), true, nil, false) {
+		t.Fatal("deleted HEAD path was not treated as superseded")
+	}
+	if !fragmentSupersededByHead([]byte("same"), true, []byte("same"), true) {
+		t.Fatal("matching HEAD content was not treated as superseded")
+	}
+	if fragmentSupersededByHead([]byte("reviewed"), true, []byte("different"), true) {
+		t.Fatal("different HEAD content was treated as superseded")
+	}
+}
+
 func TestLocateEditFollowsInsertedContextBeforeInsertion(t *testing.T) {
 	source := []string{"start", "end"}
 	current := []string{"start", "context", "end"}

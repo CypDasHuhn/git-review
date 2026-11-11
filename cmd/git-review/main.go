@@ -15,7 +15,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.12"
+const version = "0.4.13"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -1702,7 +1702,7 @@ func materializeAccepted(ctx context.Context, repo repository.Repository, state 
 			if err != nil {
 				return applied, err
 			}
-			if _, err := repo.ApplyFragment(ctx, state.ReviewedRef, patch); err != nil {
+			if _, err := repo.ApplyReviewFragment(ctx, state.ReviewedRef, patch); err != nil {
 				return applied, err
 			}
 			materialized[id] = true

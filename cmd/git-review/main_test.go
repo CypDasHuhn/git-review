@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.12\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.12", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.13\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.13", flag, output)
 		}
 	}
 }
@@ -931,6 +931,33 @@ func TestOutOfOrderAcceptanceMaterializesAfterDependencies(t *testing.T) {
 	}
 	if changes := readChanges(t, repository, binary); len(changes) != 2 {
 		t.Fatalf("remaining changes = %#v, want b fragments", changes)
+	}
+}
+
+func TestOutOfOrderAcceptanceSkipsSupersededFragment(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "before\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "example.txt", "changed\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "change example")
+	first := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, "git", "rm", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "remove example")
+	second := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	fragments := readChanges(t, repository, binary)
+	firstFragment := fragmentBy(t, fragments, first, "example.txt")
+	secondFragment := fragmentBy(t, fragments, second, "example.txt")
+	assignFragment(t, repository, binary, "remove", secondFragment)
+	assignFragment(t, repository, binary, "change", firstFragment)
+	runCommand(t, repository, binary, "group", "accept", "--name", "remove", "--path", "example.txt")
+	runCommand(t, repository, binary, "group", "accept", "--name", "change", "--path", "example.txt")
+	status := readStatus(t, repository, binary)
+	if status.AcceptedCount != 2 || status.MaterializedCount != 2 || status.PendingCount != 0 {
+		t.Fatalf("status after superseded fragment = %#v, want fully materialized", status)
+	}
+	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "example.txt"); err != nil {
+		t.Fatalf("reviewed superseded path still differs from HEAD: %v", err)
 	}
 }
 
