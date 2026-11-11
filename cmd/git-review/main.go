@@ -15,7 +15,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.9"
+const version = "0.4.10"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -330,15 +330,20 @@ func accept(ctx context.Context, args []string) error {
 		return err
 	}
 	accepted := stringSet(state.AcceptedFragments)
-	var newlyAccepted []string
+	selected := map[string]bool{}
 	for _, fragment := range fragments {
 		for _, path := range paths {
 			if fragment.TouchesPath(path) {
-				if !accepted[fragment.ID()] {
-					accepted[fragment.ID()] = true
-					newlyAccepted = append(newlyAccepted, fragment.ID())
-				}
+				selected[fragment.ID()] = true
 			}
+		}
+	}
+	includeFragmentDependencies(fragments, selected)
+	var newlyAccepted []string
+	for _, fragment := range fragments {
+		if selected[fragment.ID()] && !accepted[fragment.ID()] {
+			accepted[fragment.ID()] = true
+			newlyAccepted = append(newlyAccepted, fragment.ID())
 		}
 	}
 	state.AcceptedFragments = appendUnique(state.AcceptedFragments, newlyAccepted...)
@@ -1722,6 +1727,27 @@ func fragmentDependencies(fragments []session.Fragment) map[string][]string {
 		}
 	}
 	return dependencies
+}
+
+func includeFragmentDependencies(fragments []session.Fragment, selected map[string]bool) {
+	dependencies := fragmentDependencies(fragments)
+	for {
+		changed := false
+		for _, fragment := range fragments {
+			if !selected[fragment.ID()] {
+				continue
+			}
+			for _, dependency := range dependencies[fragment.ID()] {
+				if !selected[dependency] {
+					selected[dependency] = true
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			return
+		}
+	}
 }
 
 func fragmentGroups(groups []session.Group) map[string]string {

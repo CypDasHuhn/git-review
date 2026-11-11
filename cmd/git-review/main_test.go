@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.9\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.9", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.10\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.10", flag, output)
 		}
 	}
 }
@@ -238,6 +238,42 @@ func TestAcceptMaterializesRenameOnlyFragmentWithoutSourceInReviewBase(t *testin
 		t.Fatal("old renamed path still exists in reviewed state")
 	}
 	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "planning/brandbook/tokens.json"); err != nil {
+		t.Fatalf("reviewed rename still differs from HEAD: %v", err)
+	}
+}
+
+func TestAcceptPathIncludesRenameHistory(t *testing.T) {
+	repository := newRepository(t, map[string]string{"README.md": "initial\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "ENTRA_EXTERNAL_ID_SETUP.md", "one\ntwo\n")
+	runCommand(t, repository, "git", "add", "ENTRA_EXTERNAL_ID_SETUP.md")
+	runCommand(t, repository, "git", "commit", "-m", "add entra setup")
+	if err := os.MkdirAll(filepath.Join(repository, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "mv", "ENTRA_EXTERNAL_ID_SETUP.md", "docs/ENTRA_EXTERNAL_ID_SETUP.md")
+	runCommand(t, repository, "git", "commit", "-m", "move docs")
+	fragments := readChanges(t, repository, binary)
+	var rename session.Fragment
+	for _, fragment := range fragments {
+		if fragment.OldPath != "" && fragment.OldPath != fragment.Path {
+			rename = fragment
+			break
+		}
+	}
+	if rename.Path != "docs/ENTRA_EXTERNAL_ID_SETUP.md" || rename.OldPath != "ENTRA_EXTERNAL_ID_SETUP.md" {
+		t.Fatalf("rename fragment = %#v", rename)
+	}
+	runCommand(t, repository, binary, "accept", "--path", rename.Path)
+	status := readStatus(t, repository, binary)
+	if status.AcceptedCount != 2 || status.MaterializedCount != 2 || status.PendingCount != 0 {
+		t.Fatalf("status after path acceptance = %#v, want rename history materialized", status)
+	}
+	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("main")+":docs/ENTRA_EXTERNAL_ID_SETUP.md"); content != "one\ntwo\n" {
+		t.Fatalf("reviewed renamed content = %q", content)
+	}
+	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "docs/ENTRA_EXTERNAL_ID_SETUP.md"); err != nil {
 		t.Fatalf("reviewed rename still differs from HEAD: %v", err)
 	}
 }

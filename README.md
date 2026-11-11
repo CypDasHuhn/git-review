@@ -41,6 +41,8 @@ Review units are immutable fragments from a specific commit diff. A fragment is 
 
 `changes --json` lists unaccepted fragments. `group add` assigns every fragment from a commit, optionally limited to one path. `group assign` can assign one source fragment by its commit, path, and original diff coordinates.
 
+`accept --path` follows selected files through earlier fragment history, so accepting a renamed file also includes the prerequisite fragments from its old path.
+
 Group path filters accept exact files, directories, and `directory/...` recursive patterns.
 
 `fragment inspect` lists the immutable fragments produced by a commit and gives each one a stable full ID plus a short ID. Those IDs can be assigned later with `group assign --fragment`. `fragment list --unassigned --json` reports review fragments that do not belong to a group.
