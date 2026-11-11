@@ -1,7 +1,6 @@
 package repository
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -368,7 +367,7 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 	}
 	position, matchedLines, err := locateEdit(sourceLines, currentLines, patch.Fragment.OldStart, patch.Fragment.OldLines)
 	if err != nil {
-		if isMissingEditContext(err) && fragmentAlreadyApplied(currentLines, patch.NewLines) {
+		if isMissingEditContext(err) && fragmentAlreadyApplied(sourceLines, currentLines, patch.Fragment.OldStart, patch.Fragment.OldLines, patch.NewLines) {
 			return head, nil
 		}
 		return "", fmt.Errorf("locate fragment %s: %w", patch.Fragment.Label(), err)
@@ -519,24 +518,114 @@ func (r Repository) applyRenameOnly(ctx context.Context, ref, head string, patch
 
 func isMissingEditContext(err error) bool {
 	message := err.Error()
-	return strings.Contains(message, "source lines are not present") || strings.Contains(message, "insertion anchors are ambiguous or missing")
+	return strings.Contains(message, "source lines are not present") || strings.Contains(message, "source lines are ambiguous") || strings.Contains(message, "insertion anchors are ambiguous or missing")
 }
 
-func fragmentAlreadyApplied(current, newLines []string) bool {
+func fragmentAlreadyApplied(source, current []string, start, count int, newLines []string) bool {
 	if len(newLines) == 0 {
 		return true
 	}
-	if len(sequencePositions(current, newLines)) == 1 {
+	positions := make([]lineRange, 0)
+	for _, position := range sequencePositions(current, newLines) {
+		positions = append(positions, lineRange{start: position, end: position + len(newLines)})
+	}
+	positions = appendUniqueRanges(positions, tokenSequencePositions(current, newLines))
+	positions = appendUniqueRanges(positions, normalizedSequencePositions(current, newLines))
+	if len(positions) == 1 {
 		return true
 	}
-	return len(normalizedSequencePositions(current, newLines)) == 1
+	if len(positions) == 0 {
+		return false
+	}
+	position := start - 1
+	if count == 0 {
+		position = start
+	}
+	if position < 0 || position > len(source) || position+count > len(source) {
+		return false
+	}
+	for size := 3; size > 0; size-- {
+		before := source[max(0, position-size):position]
+		after := source[position+count : min(len(source), position+count+size)]
+		filtered := filterLineRanges(current, positions, before, after)
+		if len(filtered) == 1 {
+			return true
+		}
+		if len(before) > 0 {
+			filtered = filterLineRangesBefore(current, positions, before)
+			if len(filtered) == 1 {
+				return true
+			}
+		}
+		if len(after) > 0 {
+			filtered = filterLineRangesAfter(current, positions, after)
+			if len(filtered) == 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func appendUniqueRanges(positions, additions []lineRange) []lineRange {
+	for _, addition := range additions {
+		found := false
+		for _, position := range positions {
+			if position == addition {
+				found = true
+				break
+			}
+		}
+		if !found {
+			positions = append(positions, addition)
+		}
+	}
+	return positions
+}
+
+func filterLineRanges(lines []string, positions []lineRange, before, after []string) []lineRange {
+	var filtered []lineRange
+	for _, position := range positions {
+		if len(before) > position.start || len(after) > len(lines)-position.end {
+			continue
+		}
+		if sameLines(lines[position.start-len(before):position.start], before) && sameLines(lines[position.end:position.end+len(after)], after) {
+			filtered = append(filtered, position)
+		}
+	}
+	return filtered
+}
+
+func filterLineRangesBefore(lines []string, positions []lineRange, before []string) []lineRange {
+	var filtered []lineRange
+	for _, position := range positions {
+		if len(before) <= position.start && sameLines(lines[position.start-len(before):position.start], before) {
+			filtered = append(filtered, position)
+		}
+	}
+	return filtered
+}
+
+func filterLineRangesAfter(lines []string, positions []lineRange, after []string) []lineRange {
+	var filtered []lineRange
+	for _, position := range positions {
+		if len(after) <= len(lines)-position.end && sameLines(lines[position.end:position.end+len(after)], after) {
+			filtered = append(filtered, position)
+		}
+	}
+	return filtered
 }
 
 func fragmentSupersededByHead(currentData []byte, currentExists bool, targetData []byte, targetExists bool) bool {
 	if !targetExists {
 		return true
 	}
-	return currentExists && bytes.Equal(currentData, targetData)
+	if !currentExists {
+		return false
+	}
+	currentLines, _ := splitLines(currentData)
+	targetLines, _ := splitLines(targetData)
+	return sameLines(currentLines, targetLines)
 }
 
 func (r Repository) fragmentSupersededByHead(ctx context.Context, ref string, fragment session.Fragment) (bool, error) {

@@ -1,6 +1,9 @@
 package repository
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestParseFragmentPatchesIncludesRenameOnlyChanges(t *testing.T) {
 	output := "diff --git a/Brandbook/tokens.json b/planning/brandbook/tokens.json\n" +
@@ -88,8 +91,26 @@ func TestFragmentSupersededByHead(t *testing.T) {
 	if !fragmentSupersededByHead([]byte("same"), true, []byte("same"), true) {
 		t.Fatal("matching HEAD content was not treated as superseded")
 	}
+	if !fragmentSupersededByHead([]byte("same\r\n"), true, []byte("same\n"), true) {
+		t.Fatal("matching HEAD content with different line endings was not treated as superseded")
+	}
 	if fragmentSupersededByHead([]byte("reviewed"), true, []byte("different"), true) {
 		t.Fatal("different HEAD content was treated as superseded")
+	}
+}
+
+func TestAmbiguousEditContextCanBeSuperseded(t *testing.T) {
+	if !isMissingEditContext(errors.New("source lines are ambiguous in the reviewed state")) {
+		t.Fatal("ambiguous source context was not recognized")
+	}
+}
+
+func TestFragmentAlreadyAppliedUsesSourceContext(t *testing.T) {
+	source := []string{"before", "if (error != null) return error;", "return null;", "after"}
+	current := []string{"before", "if (error != null)", "return error;", "return null;", "other", "if (error != null)", "return error;", "return null;", "after"}
+	newLines := []string{"if (error != null)", "return error;"}
+	if !fragmentAlreadyApplied(source, current, 2, 1, newLines) {
+		t.Fatal("formatted fragment was not located by source context")
 	}
 }
 

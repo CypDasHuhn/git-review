@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.13\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.13", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.14\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.14", flag, output)
 		}
 	}
 }
