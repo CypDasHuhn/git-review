@@ -16,7 +16,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.15"
+const version = "0.4.16"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -349,7 +349,7 @@ func accept(ctx context.Context, args []string) error {
 	}
 	state.AcceptedFragments = appendUnique(state.AcceptedFragments, newlyAccepted...)
 	store := session.NewStore(repo.GitDir)
-	materialized, err := materializeAccepted(ctx, repo, &state, fragments)
+	materialized, err := materializeAccepted(ctx, repo, &state, fragments, selected)
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,8 @@ func acceptGroup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	materialized, err := materializeAccepted(ctx, repo, &state, fragments)
+	requested := stringSet(fragmentIDs(selected))
+	materialized, err := materializeAccepted(ctx, repo, &state, fragments, requested)
 	if err != nil {
 		return err
 	}
@@ -1687,7 +1688,7 @@ func validateGroupGraph(ctx context.Context, repo repository.Repository, state s
 	return nil
 }
 
-func materializeAccepted(ctx context.Context, repo repository.Repository, state *session.State, fragments []session.Fragment) ([]string, error) {
+func materializeAccepted(ctx context.Context, repo repository.Repository, state *session.State, fragments []session.Fragment, requested map[string]bool) ([]string, error) {
 	originalHead, err := repo.ResolveCommit(ctx, state.ReviewedRef)
 	if err != nil {
 		return nil, err
@@ -1700,12 +1701,42 @@ func materializeAccepted(ctx context.Context, repo repository.Repository, state 
 	dependencies := fragmentDependencies(fragments)
 	accepted := stringSet(state.AcceptedFragments)
 	materialized := stringSet(state.MaterializedFragments)
+	dependents := map[string][]string{}
+	for id, prerequisites := range dependencies {
+		for _, prerequisite := range prerequisites {
+			dependents[prerequisite] = append(dependents[prerequisite], id)
+		}
+	}
+	candidates := map[string]bool{}
+	for id := range requested {
+		candidates[id] = true
+	}
+	for {
+		changed := false
+		for id := range candidates {
+			for _, dependency := range dependencies[id] {
+				if accepted[dependency] && !candidates[dependency] {
+					candidates[dependency] = true
+					changed = true
+				}
+			}
+			for _, dependent := range dependents[id] {
+				if accepted[dependent] && !candidates[dependent] {
+					candidates[dependent] = true
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
 	var applied []string
 	for {
 		progress := false
 		for _, fragment := range fragments {
 			id := fragment.ID()
-			if !accepted[id] || materialized[id] || hasUnmaterializedDependency(id, dependencies, materialized) {
+			if !candidates[id] || !accepted[id] || materialized[id] || hasUnmaterializedDependency(id, dependencies, materialized) {
 				continue
 			}
 			patch, err := repo.FragmentPatch(ctx, fragment)

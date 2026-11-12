@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.15\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.15", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.16\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.16", flag, output)
 		}
 	}
 }
@@ -890,6 +890,65 @@ func TestGroupAcceptanceRollsBackEarlierFragmentsOnFailure(t *testing.T) {
 	status := readStatus(t, repository, binary)
 	if status.ReviewedCommit != initialReviewed || status.AcceptedCount != 0 || status.MaterializedCount != 0 {
 		t.Fatalf("status after rolled back group acceptance = %#v", status)
+	}
+}
+
+func TestPathAcceptanceIgnoresUnrelatedAcceptedPendingFragments(t *testing.T) {
+	repository := newRepository(t, map[string]string{
+		"ambiguous.txt": "a\nb\na\nb\na\nb\na\n",
+		"healthy.txt":   "before\n",
+	})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "ambiguous.txt", "top\na\nb\ntarget\na\nb\na\nb\na\n")
+	runCommand(t, repository, "git", "add", "ambiguous.txt")
+	runCommand(t, repository, "git", "commit", "-m", "ambiguous insertions")
+	var top, target session.Fragment
+	for _, fragment := range readChanges(t, repository, binary) {
+		if fragment.Path != "ambiguous.txt" {
+			continue
+		}
+		if fragment.OldStart == 0 {
+			top = fragment
+		} else {
+			target = fragment
+		}
+	}
+	if top.Commit == "" || target.Commit == "" {
+		t.Fatalf("ambiguous fragments = %#v, %#v", top, target)
+	}
+	assignFragment(t, repository, binary, "top", top)
+	assignFragment(t, repository, binary, "target", target)
+	runCommand(t, repository, binary, "group", "accept", "--name", "top", "--path", "ambiguous.txt")
+	gitDir := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "--absolute-git-dir"))
+	store := session.NewStore(gitDir)
+	state, err := store.Load("main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.AcceptedFragments = appendUnique(state.AcceptedFragments, target.ID())
+	if err := store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repository, "healthy.txt", "after\n")
+	runCommand(t, repository, "git", "add", "healthy.txt")
+	runCommand(t, repository, "git", "commit", "-m", "healthy change")
+	runCommand(t, repository, binary, "accept", "--path", "healthy.txt")
+	status := readStatus(t, repository, binary)
+	if status.AcceptedCount != 3 || status.MaterializedCount != 2 || status.PendingCount != 1 {
+		t.Fatalf("status after scoped path acceptance = %#v", status)
+	}
+	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("main")+":healthy.txt"); content != "after\n" {
+		t.Fatalf("healthy reviewed content = %q", content)
+	}
+	var views []fragmentStatus
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "fragment", "list", "--json")), &views); err != nil {
+		t.Fatal(err)
+	}
+	for _, view := range views {
+		if view.ID == target.ID() && view.Status != "accepted-pending" {
+			t.Fatalf("unrelated target status = %#v", view)
+		}
 	}
 }
 
