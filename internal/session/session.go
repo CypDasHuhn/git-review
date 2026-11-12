@@ -23,6 +23,8 @@ type State struct {
 	AcceptedFragments          []string   `json:"acceptedFragments,omitempty"`
 	MaterializedFragments      []string   `json:"materializedFragments,omitempty"`
 	MaterializedPathOperations [][]string `json:"materializedPathOperations,omitempty"`
+	MaterializedPathFragments  [][]string `json:"materializedPathFragments,omitempty"`
+	AcceptedPathFragments      [][]string `json:"acceptedPathFragments,omitempty"`
 }
 
 type Status struct {

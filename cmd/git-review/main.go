@@ -16,7 +16,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.16"
+const version = "0.4.17"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -349,9 +349,12 @@ func accept(ctx context.Context, args []string) error {
 	}
 	state.AcceptedFragments = appendUnique(state.AcceptedFragments, newlyAccepted...)
 	store := session.NewStore(repo.GitDir)
-	materialized, err := materializeAccepted(ctx, repo, &state, fragments, selected)
+	materialized, syncedPaths, err := materializeAcceptedPaths(ctx, repo, &state, fragments, selected)
 	if err != nil {
 		return err
+	}
+	if len(syncedPaths) > 0 {
+		appendPathOperation(&state, syncedPaths, materialized, intersectStrings(materialized, newlyAccepted))
 	}
 	if err := store.Save(state); err != nil {
 		return err
@@ -364,7 +367,7 @@ func accept(ctx context.Context, args []string) error {
 		if _, err := repo.SyncPaths(ctx, state.ReviewedRef, "HEAD", reconciled, "accept paths: reconcile reviewed paths"); err != nil {
 			return err
 		}
-		state.MaterializedPathOperations = append(state.MaterializedPathOperations, reconciled)
+		appendPathOperation(&state, reconciled, []string{}, []string{})
 		if err := store.Save(state); err != nil {
 			return err
 		}
@@ -399,7 +402,21 @@ func undo(ctx context.Context, args []string) error {
 			if !undone {
 				return errors.New("reviewed state history does not contain a materialized path operation")
 			}
-			state.MaterializedPathOperations = state.MaterializedPathOperations[:len(state.MaterializedPathOperations)-1]
+			appendPathOperationMetadata(&state)
+			operationIndex := len(state.MaterializedPathOperations) - 1
+			state.MaterializedPathOperations = state.MaterializedPathOperations[:operationIndex]
+			if len(state.MaterializedPathFragments) > operationIndex {
+				for _, fragment := range state.MaterializedPathFragments[operationIndex] {
+					state.MaterializedFragments = removeString(state.MaterializedFragments, fragment)
+				}
+				state.MaterializedPathFragments = state.MaterializedPathFragments[:operationIndex]
+			}
+			if len(state.AcceptedPathFragments) > operationIndex {
+				for _, fragment := range state.AcceptedPathFragments[operationIndex] {
+					state.AcceptedFragments = removeString(state.AcceptedFragments, fragment)
+				}
+				state.AcceptedPathFragments = state.AcceptedPathFragments[:operationIndex]
+			}
 			if err := session.NewStore(repo.GitDir).Save(state); err != nil {
 				return err
 			}
@@ -485,6 +502,8 @@ func reset(ctx context.Context, args []string) error {
 	state.AcceptedFragments = nil
 	state.MaterializedFragments = nil
 	state.MaterializedPathOperations = nil
+	state.MaterializedPathFragments = nil
+	state.AcceptedPathFragments = nil
 	if err := session.NewStore(repo.GitDir).Save(state); err != nil {
 		return err
 	}
@@ -783,8 +802,9 @@ func viewGroup(ctx context.Context, args []string) error {
 			continue
 		}
 		views := make([]fragmentView, 0, len(group.Fragments))
+		patchCache := newFragmentPatchCache()
 		for _, fragment := range group.Fragments {
-			patch, err := repo.FragmentPatch(ctx, fragment.Fragment)
+			patch, err := patchCache.get(ctx, repo, fragment.Fragment)
 			if err != nil {
 				return err
 			}
@@ -839,32 +859,50 @@ func projectGroup(ctx context.Context, args []string) error {
 	}
 	applied := map[string]bool{}
 	appliedIDs := make([]string, 0)
+	patchCache := newFragmentPatchCache()
+	batches := fragmentBatches(fragments, selected)
 	for {
 		progress := false
-		for _, fragment := range fragments {
-			id := fragment.ID()
-			if !selected[id] || materialized[id] || applied[id] {
-				continue
-			}
+		for _, batch := range batches {
+			batchIDs := stringSet(fragmentIDs(batch))
+			pending := make([]session.Fragment, 0, len(batch))
 			ready := true
-			for _, dependency := range dependencies[id] {
-				if !materialized[dependency] && !applied[dependency] {
-					ready = false
+			for _, fragment := range batch {
+				id := fragment.ID()
+				if materialized[id] || applied[id] {
+					continue
+				}
+				pending = append(pending, fragment)
+				for _, dependency := range dependencies[id] {
+					if !materialized[dependency] && !applied[dependency] && !batchIDs[dependency] {
+						ready = false
+						break
+					}
+				}
+				if !ready {
 					break
 				}
 			}
-			if !ready {
+			if !ready || len(pending) == 0 {
 				continue
 			}
-			patch, err := repo.FragmentPatch(ctx, fragment)
+			patches := make([]repository.FragmentPatch, 0, len(batch))
+			for _, fragment := range batch {
+				patch, err := patchCache.get(ctx, repo, fragment)
+				if err != nil {
+					return err
+				}
+				patches = append(patches, patch)
+			}
+			err := applyFragmentPatches(ctx, repo, projectionRef, patches, false)
 			if err != nil {
-				return err
+				return fmt.Errorf("project fragment batch %s: %w", batch[0].Label(), err)
 			}
-			if _, err := repo.ApplyFragment(ctx, projectionRef, patch); err != nil {
-				return fmt.Errorf("project fragment %s: %w", fragment.Label(), err)
+			for _, fragment := range pending {
+				id := fragment.ID()
+				applied[id] = true
+				appliedIDs = append(appliedIDs, id)
 			}
-			applied[id] = true
-			appliedIDs = append(appliedIDs, id)
 			progress = true
 		}
 		if !progress {
@@ -1688,6 +1726,102 @@ func validateGroupGraph(ctx context.Context, repo repository.Repository, state s
 	return nil
 }
 
+func materializeAcceptedPaths(ctx context.Context, repo repository.Repository, state *session.State, fragments []session.Fragment, selected map[string]bool) ([]string, []string, error) {
+	originalHead, err := repo.ResolveCommit(ctx, state.ReviewedRef)
+	if err != nil {
+		return nil, nil, err
+	}
+	transactionRef := fmt.Sprintf("%s-transaction-%d", state.ReviewedRef, time.Now().UnixNano())
+	if err := repo.CreateRef(ctx, transactionRef, originalHead); err != nil {
+		return nil, nil, err
+	}
+	defer repo.DeleteRef(context.Background(), transactionRef)
+	materialized := stringSet(state.MaterializedFragments)
+	newlySelected := map[string]bool{}
+	for _, fragment := range fragments {
+		id := fragment.ID()
+		if selected[id] && !materialized[id] {
+			newlySelected[id] = true
+		}
+	}
+	paths := fragmentPaths(fragments, newlySelected)
+	var synced []string
+	if len(paths) > 0 {
+		synced, err = repo.DiffPaths(ctx, transactionRef, "HEAD", paths)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(synced) > 0 {
+			if _, err := repo.SyncPaths(ctx, transactionRef, "HEAD", synced, "accept paths: synchronize reviewed paths"); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	finalHead, err := repo.ResolveCommit(ctx, transactionRef)
+	if err != nil {
+		return nil, nil, err
+	}
+	if finalHead != originalHead {
+		if err := repo.ResetRef(ctx, state.ReviewedRef, finalHead); err != nil {
+			return nil, nil, err
+		}
+	}
+	newlyMaterialized := make([]string, 0)
+	for _, fragment := range fragments {
+		id := fragment.ID()
+		if newlySelected[id] {
+			materialized[id] = true
+			newlyMaterialized = append(newlyMaterialized, id)
+		}
+	}
+	state.MaterializedFragments = appendUnique(state.MaterializedFragments, newlyMaterialized...)
+	return newlyMaterialized, synced, nil
+}
+
+func fragmentPaths(fragments []session.Fragment, selected map[string]bool) []string {
+	seen := map[string]bool{}
+	paths := make([]string, 0)
+	for _, fragment := range fragments {
+		if !selected[fragment.ID()] {
+			continue
+		}
+		for _, path := range fragment.Paths() {
+			if !seen[path] {
+				seen[path] = true
+				paths = append(paths, path)
+			}
+		}
+	}
+	return paths
+}
+
+func intersectStrings(left, right []string) []string {
+	known := stringSet(right)
+	result := make([]string, 0)
+	for _, value := range left {
+		if known[value] {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func appendPathOperation(state *session.State, paths, materialized, accepted []string) {
+	appendPathOperationMetadata(state)
+	state.MaterializedPathOperations = append(state.MaterializedPathOperations, paths)
+	state.MaterializedPathFragments = append(state.MaterializedPathFragments, materialized)
+	state.AcceptedPathFragments = append(state.AcceptedPathFragments, accepted)
+}
+
+func appendPathOperationMetadata(state *session.State) {
+	for len(state.MaterializedPathFragments) < len(state.MaterializedPathOperations) {
+		state.MaterializedPathFragments = append(state.MaterializedPathFragments, []string{})
+	}
+	for len(state.AcceptedPathFragments) < len(state.MaterializedPathOperations) {
+		state.AcceptedPathFragments = append(state.AcceptedPathFragments, []string{})
+	}
+}
+
 func materializeAccepted(ctx context.Context, repo repository.Repository, state *session.State, fragments []session.Fragment, requested map[string]bool) ([]string, error) {
 	originalHead, err := repo.ResolveCommit(ctx, state.ReviewedRef)
 	if err != nil {
@@ -1731,23 +1865,54 @@ func materializeAccepted(ctx context.Context, repo repository.Repository, state 
 			break
 		}
 	}
+	batches := fragmentBatches(fragments, candidates)
+	patchCache := newFragmentPatchCache()
 	var applied []string
 	for {
 		progress := false
-		for _, fragment := range fragments {
-			id := fragment.ID()
-			if !candidates[id] || !accepted[id] || materialized[id] || hasUnmaterializedDependency(id, dependencies, materialized) {
+		for _, batch := range batches {
+			pending := make([]session.Fragment, 0, len(batch))
+			batchIDs := stringSet(fragmentIDs(batch))
+			ready := true
+			for _, fragment := range batch {
+				id := fragment.ID()
+				if !accepted[id] {
+					ready = false
+					break
+				}
+				if !materialized[id] {
+					pending = append(pending, fragment)
+				}
+				for _, dependency := range dependencies[id] {
+					if !materialized[dependency] && !batchIDs[dependency] {
+						ready = false
+						break
+					}
+				}
+				if !ready {
+					break
+				}
+			}
+			if !ready || len(pending) == 0 {
 				continue
 			}
-			patch, err := repo.FragmentPatch(ctx, fragment)
+			patches := make([]repository.FragmentPatch, 0, len(batch))
+			for _, fragment := range batch {
+				patch, err := patchCache.get(ctx, repo, fragment)
+				if err != nil {
+					return applied, err
+				}
+				patches = append(patches, patch)
+			}
+			err := applyFragmentPatches(ctx, repo, transactionRef, patches, true)
 			if err != nil {
 				return applied, err
 			}
-			if _, err := repo.ApplyReviewFragment(ctx, transactionRef, patch); err != nil {
-				return applied, err
+			for _, fragment := range pending {
+				id := fragment.ID()
+				materialized[id] = true
+				applied = append(applied, id)
 			}
-			materialized[id] = true
-			applied = append(applied, id)
 			progress = true
 		}
 		if !progress {
@@ -1765,6 +1930,84 @@ func materializeAccepted(ctx context.Context, repo repository.Repository, state 
 	}
 	state.MaterializedFragments = appendUnique(state.MaterializedFragments, applied...)
 	return applied, nil
+}
+
+func applyFragmentPatches(ctx context.Context, repo repository.Repository, ref string, patches []repository.FragmentPatch, review bool) error {
+	if len(patches) == 1 {
+		if review {
+			_, err := repo.ApplyReviewFragment(ctx, ref, patches[0])
+			return err
+		}
+		_, err := repo.ApplyFragment(ctx, ref, patches[0])
+		return err
+	}
+	if _, err := repo.ApplyFragmentBatch(ctx, ref, patches); err == nil {
+		return nil
+	} else {
+		for _, patch := range patches {
+			var singleErr error
+			if review {
+				_, singleErr = repo.ApplyReviewFragment(ctx, ref, patch)
+			} else {
+				_, singleErr = repo.ApplyFragment(ctx, ref, patch)
+			}
+			if singleErr != nil {
+				return fmt.Errorf("batch application failed: %v; fallback fragment %s: %w", err, patch.Fragment.Label(), singleErr)
+			}
+		}
+		return nil
+	}
+}
+
+func fragmentBatches(fragments []session.Fragment, selected map[string]bool) [][]session.Fragment {
+	indices := map[string]int{}
+	batches := make([][]session.Fragment, 0)
+	for _, fragment := range fragments {
+		if !selected[fragment.ID()] {
+			continue
+		}
+		key := fragmentBatchKey(fragment)
+		index, ok := indices[key]
+		if !ok {
+			indices[key] = len(batches)
+			batches = append(batches, []session.Fragment{fragment})
+			continue
+		}
+		batches[index] = append(batches[index], fragment)
+	}
+	return batches
+}
+
+type fragmentPatchCache struct {
+	byCommit map[string]map[string]repository.FragmentPatch
+}
+
+func newFragmentPatchCache() *fragmentPatchCache {
+	return &fragmentPatchCache{byCommit: map[string]map[string]repository.FragmentPatch{}}
+}
+
+func (c *fragmentPatchCache) get(ctx context.Context, repo repository.Repository, fragment session.Fragment) (repository.FragmentPatch, error) {
+	patches, ok := c.byCommit[fragment.Commit]
+	if !ok {
+		commitPatches, err := repo.CommitFragments(ctx, fragment.Commit)
+		if err != nil {
+			return repository.FragmentPatch{}, err
+		}
+		patches = make(map[string]repository.FragmentPatch, len(commitPatches))
+		for _, patch := range commitPatches {
+			patches[patch.Fragment.ID()] = patch
+		}
+		c.byCommit[fragment.Commit] = patches
+	}
+	patch, ok := patches[fragment.ID()]
+	if !ok {
+		return repository.FragmentPatch{}, fmt.Errorf("fragment %s no longer exists in commit %s", fragment.Label(), fragment.Commit)
+	}
+	return patch, nil
+}
+
+func fragmentBatchKey(fragment session.Fragment) string {
+	return strings.Join([]string{fragment.Commit, fragment.Parent, fragment.Path, fragment.OldPath}, "\x00")
 }
 
 func allFragments(ctx context.Context, repo repository.Repository, state session.State) ([]session.Fragment, error) {
@@ -1913,15 +2156,6 @@ func groupCycle(edges map[string]map[string]bool) []string {
 		}
 	}
 	return nil
-}
-
-func hasUnmaterializedDependency(id string, dependencies map[string][]string, materialized map[string]bool) bool {
-	for _, dependency := range dependencies[id] {
-		if !materialized[dependency] {
-			return true
-		}
-	}
-	return false
 }
 
 func fragmentIDs(fragments []session.Fragment) []string {

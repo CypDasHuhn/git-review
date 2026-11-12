@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -346,6 +347,170 @@ func (r Repository) ApplyFragment(ctx context.Context, ref string, patch Fragmen
 		return commit, err
 	}
 	return r.applyFragmentByLocation(ctx, ref, patch)
+}
+
+func (r Repository) ApplyFragmentBatch(ctx context.Context, ref string, patches []FragmentPatch) (string, error) {
+	if len(patches) == 0 {
+		return "", errors.New("fragment batch is empty")
+	}
+	if len(patches) == 1 {
+		return r.ApplyFragment(ctx, ref, patches[0])
+	}
+	first := patches[0].Fragment
+	for _, patch := range patches[1:] {
+		fragment := patch.Fragment
+		if fragment.Commit != first.Commit || fragment.Parent != first.Parent || fragment.Path != first.Path || fragment.OldPath != first.OldPath {
+			return "", errors.New("fragment batch contains different files or commits")
+		}
+	}
+	if first.OldPath != "" && first.OldPath != first.Path {
+		return "", fmt.Errorf("fragment batch cannot combine rename fragments for %s", first.Label())
+	}
+	head, err := r.ResolveCommit(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	baseData, baseExists, err := r.treeFile(ctx, first.Parent, first.Path)
+	if err != nil {
+		return "", err
+	}
+	currentData, currentExists, err := r.treeFile(ctx, head, first.Path)
+	if err != nil {
+		return "", err
+	}
+	baseLines, trailingNewline := splitLines(baseData)
+	if !baseExists {
+		baseLines = nil
+		trailingNewline = true
+	}
+	targetData, targetExists, err := r.treeFile(ctx, first.Commit, first.Path)
+	if err != nil {
+		return "", err
+	}
+	if sameTreeFile(currentData, currentExists, targetData, targetExists) {
+		return head, nil
+	}
+	targetLines, targetNewline := splitLines(targetData)
+	ordered := append([]FragmentPatch{}, patches...)
+	sort.SliceStable(ordered, func(left, right int) bool {
+		if ordered[left].Fragment.OldStart == ordered[right].Fragment.OldStart {
+			return ordered[left].Fragment.NewStart > ordered[right].Fragment.NewStart
+		}
+		return ordered[left].Fragment.OldStart > ordered[right].Fragment.OldStart
+	})
+	updated := append([]string{}, baseLines...)
+	for _, patch := range ordered {
+		fragment := patch.Fragment
+		position := fragment.OldStart - 1
+		if fragment.OldLines == 0 {
+			position = fragment.OldStart
+		}
+		if position < 0 || position > len(baseLines) || position+fragment.OldLines > len(baseLines) {
+			return "", fmt.Errorf("fragment %s source range is invalid in its commit parent", fragment.Label())
+		}
+		if fragment.OldLines > 0 && !sameLines(baseLines[position:position+fragment.OldLines], patch.OldLines) {
+			return "", fmt.Errorf("fragment %s source content differs from its commit parent", fragment.Label())
+		}
+		updated = append(updated[:position:position], append(append([]string{}, patch.NewLines...), updated[position+fragment.OldLines:]...)...)
+		if fragment.NewLines > 0 && fragment.NewStart-1+fragment.NewLines >= len(targetLines) {
+			trailingNewline = targetNewline
+		}
+	}
+	selectedData := joinLines(updated, trailingNewline)
+	mergedData, err := mergeFragmentData(ctx, r.Root, currentData, currentExists, baseData, baseExists, selectedData, targetExists)
+	if err != nil {
+		if !strings.Contains(err.Error(), "fragment conflicts with the reviewed state") {
+			return "", fmt.Errorf("merge fragment batch %s: %w", first.Label(), err)
+		}
+		return r.applyFragmentBatchByLocation(ctx, ref, head, first, ordered, baseLines, currentData, currentExists, targetExists, targetLines, targetNewline)
+	}
+	if sameTreeFile(currentData, currentExists, mergedData, targetExists) {
+		return head, nil
+	}
+	return r.commitFileData(ctx, ref, head, first.Path, mergedData, targetExists, first.Commit, "accept "+first.ShortCommit+":"+first.Path)
+}
+
+func (r Repository) applyFragmentBatchByLocation(ctx context.Context, ref, head string, first session.Fragment, patches []FragmentPatch, sourceLines []string, currentData []byte, currentExists, targetExists bool, targetLines []string, targetNewline bool) (string, error) {
+	currentLines, trailingNewline := splitLines(currentData)
+	if !currentExists {
+		currentLines = nil
+		trailingNewline = true
+	}
+	updated := append([]string{}, currentLines...)
+	for _, patch := range patches {
+		fragment := patch.Fragment
+		if fragment.OldLines == 0 && fragmentAlreadyApplied(sourceLines, updated, fragment.OldStart, fragment.OldLines, patch.NewLines) {
+			continue
+		}
+		position, matchedLines, err := locateEdit(sourceLines, updated, fragment.OldStart, fragment.OldLines)
+		if err != nil {
+			if isMissingEditContext(err) && fragmentAlreadyApplied(sourceLines, updated, fragment.OldStart, fragment.OldLines, patch.NewLines) {
+				continue
+			}
+			return "", fmt.Errorf("locate fragment batch %s: %w", fragment.Label(), err)
+		}
+		if matchedLines > 0 && position+matchedLines > len(updated) {
+			return "", fmt.Errorf("fragment batch %s exceeds current file", fragment.Label())
+		}
+		next := make([]string, 0, len(updated)-matchedLines+len(patch.NewLines))
+		next = append(next, updated[:position]...)
+		next = append(next, patch.NewLines...)
+		next = append(next, updated[position+matchedLines:]...)
+		updated = next
+		if fragment.NewLines > 0 && fragment.NewStart-1+fragment.NewLines >= len(targetLines) {
+			trailingNewline = targetNewline
+		}
+	}
+	selectedData := joinLines(updated, trailingNewline)
+	if sameTreeFile(currentData, currentExists, selectedData, targetExists) {
+		return head, nil
+	}
+	return r.commitFileData(ctx, ref, head, first.Path, selectedData, targetExists, first.Commit, "accept "+first.ShortCommit+":"+first.Path)
+}
+
+func (r Repository) commitFileData(ctx context.Context, ref, head, path string, data []byte, exists bool, modeRef, subject string) (string, error) {
+	indexPath, err := temporaryIndex()
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(indexPath)
+	env := map[string]string{"GIT_INDEX_FILE": indexPath}
+	if _, err := gitWithEnv(ctx, r.Root, env, "read-tree", head); err != nil {
+		return "", err
+	}
+	if !exists {
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--force-remove", "--", path); err != nil {
+			return "", err
+		}
+	} else {
+		blob, err := gitWithInput(ctx, r.Root, env, data, "hash-object", "-w", "--stdin")
+		if err != nil {
+			return "", err
+		}
+		mode, err := r.fileMode(ctx, modeRef, path)
+		if err != nil {
+			mode, err = r.fileMode(ctx, head, path)
+			if err != nil {
+				return "", err
+			}
+		}
+		cacheInfo := mode + "," + blob + "," + path
+		if _, err := gitWithEnv(ctx, r.Root, env, "update-index", "--add", "--cacheinfo", cacheInfo); err != nil {
+			return "", err
+		}
+	}
+	tree, err := gitWithEnv(ctx, r.Root, env, "write-tree")
+	if err != nil {
+		return "", err
+	}
+	commit, err := git(ctx, r.Root, "commit-tree", tree, "-p", head, "-m", subject)
+	if err != nil {
+		return "", err
+	}
+	if _, err := git(ctx, r.Root, "update-ref", ref, commit, head); err != nil {
+		return "", err
+	}
+	return commit, nil
 }
 
 func (r Repository) applyFragmentThreeWay(ctx context.Context, ref string, patch FragmentPatch) (string, error) {

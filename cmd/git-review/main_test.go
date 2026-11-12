@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.16\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.16", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.17\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.17", flag, output)
 		}
 	}
 }
@@ -275,6 +275,48 @@ func TestAcceptPathIncludesRenameHistory(t *testing.T) {
 	}
 	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "docs/ENTRA_EXTERNAL_ID_SETUP.md"); err != nil {
 		t.Fatalf("reviewed rename still differs from HEAD: %v", err)
+	}
+}
+
+func TestAcceptPathSynchronizesAllFragmentsAcrossCommitsAndUndo(t *testing.T) {
+	initial := "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n"
+	repository := newRepository(t, map[string]string{"example.txt": initial})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "example.txt", "ONE\ntwo\nthree\nFOUR\nfive\nsix\nSEVEN\neight\nnine\nten\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "first file edits")
+	first := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	writeFile(t, repository, "example.txt", "ONE\nTWO\nthree\nFOUR\nfive\nSIX\nSEVEN\neight\nNINE\nten\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "second file edits")
+	second := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	fragments := readChanges(t, repository, binary)
+	commits := map[string]bool{}
+	for _, fragment := range fragments {
+		if fragment.Path != "example.txt" {
+			t.Fatalf("fragment = %#v, want example.txt", fragment)
+		}
+		commits[fragment.Commit] = true
+	}
+	if !commits[first] || !commits[second] || len(commits) != 2 || len(fragments) < 4 {
+		t.Fatalf("fragments = %#v, want multiple fragments from both commits", fragments)
+	}
+	runCommand(t, repository, binary, "accept", "--path", "example.txt")
+	status := readStatus(t, repository, binary)
+	if status.AcceptedCount != len(fragments) || status.MaterializedCount != len(fragments) || status.PendingCount != 0 {
+		t.Fatalf("status after full-file acceptance = %#v, want all fragments materialized", status)
+	}
+	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "example.txt"); err != nil {
+		t.Fatalf("reviewed file still differs from HEAD: %v", err)
+	}
+	runCommand(t, repository, binary, "undo")
+	status = readStatus(t, repository, binary)
+	if status.AcceptedCount != 0 || status.MaterializedCount != 0 || status.PendingCount != 0 {
+		t.Fatalf("status after undoing full-file acceptance = %#v, want empty review state", status)
+	}
+	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("main")+":example.txt"); content != initial {
+		t.Fatalf("reviewed file after undo = %q, want initial content", content)
 	}
 }
 
@@ -875,17 +917,28 @@ func TestGroupAcceptanceRollsBackEarlierFragmentsOnFailure(t *testing.T) {
 	initialReviewed := readStatus(t, repository, binary).ReviewedCommit
 	writeFile(t, repository, "example.txt", "top\na\nb\ntarget\na\nb\na\nb\na\n")
 	runCommand(t, repository, "git", "add", "example.txt")
-	runCommand(t, repository, "git", "commit", "-m", "ambiguous insertions")
+	runCommand(t, repository, "git", "commit", "-m", "valid fragments")
 	fragments := readChanges(t, repository, binary)
 	if len(fragments) != 2 {
 		t.Fatalf("fragments = %#v, want two insertions", fragments)
 	}
-	for _, fragment := range fragments {
-		assignFragment(t, repository, binary, "all", fragment)
+	invalid := session.Fragment{
+		Commit:      strings.Repeat("0", 40),
+		Parent:      strings.Repeat("0", 40),
+		ShortCommit: "0000000",
+		Path:        "other.txt",
+		OldStart:    1,
+		NewStart:    1,
+		NewLines:    1,
 	}
-	output, err := runCommandError(t, repository, binary, "group", "accept", "--name", "all", "--path", "example.txt")
-	if err == nil || !strings.Contains(output, "ambiguous") {
-		t.Fatalf("ambiguous group acceptance output = %q, err = %v", output, err)
+	gitDir := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "--absolute-git-dir"))
+	store := session.NewStore(gitDir)
+	if err := store.SaveGroups("main", []session.Group{{Name: "all", Fragments: []session.Fragment{fragments[0], invalid}}}); err != nil {
+		t.Fatal(err)
+	}
+	output, err := runCommandError(t, repository, binary, "group", "accept", "--name", "all", "--path", "example.txt", "--path", "other.txt")
+	if err == nil || output == "" {
+		t.Fatalf("invalid group acceptance output = %q, err = %v", output, err)
 	}
 	status := readStatus(t, repository, binary)
 	if status.ReviewedCommit != initialReviewed || status.AcceptedCount != 0 || status.MaterializedCount != 0 {
@@ -1076,6 +1129,31 @@ func TestGroupAcceptMaterializesFragmentsFromSameCommitWithoutDrift(t *testing.T
 	}
 	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "example.txt"); err != nil {
 		t.Fatalf("reviewed same-commit fragments still differ from HEAD: %v", err)
+	}
+}
+
+func TestGroupAcceptBatchesMultipleCommitsForOneFile(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n"})
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	writeFile(t, repository, "example.txt", "ONE\ntwo\nthree\nFOUR\nfive\nsix\nSEVEN\neight\nnine\nten\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "first grouped edits")
+	first := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	writeFile(t, repository, "example.txt", "ONE\nTWO\nthree\nFOUR\nfive\nSIX\nSEVEN\neight\nNINE\nten\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "second grouped edits")
+	second := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	fragments := readChanges(t, repository, binary)
+	runCommand(t, repository, binary, "group", "add", "--name", "all", "--commit", first)
+	runCommand(t, repository, binary, "group", "add", "--name", "all", "--commit", second)
+	runCommand(t, repository, binary, "group", "accept", "--name", "all", "--path", "example.txt")
+	status := readStatus(t, repository, binary)
+	if status.AcceptedCount != len(fragments) || status.MaterializedCount != len(fragments) || status.PendingCount != 0 {
+		t.Fatalf("status after grouped multi-commit acceptance = %#v, want all fragments materialized", status)
+	}
+	if _, err := runCommandError(t, repository, "git", "diff", "--quiet", session.ReviewedRef("main"), "HEAD", "--", "example.txt"); err != nil {
+		t.Fatalf("reviewed grouped file still differs from HEAD: %v", err)
 	}
 }
 
