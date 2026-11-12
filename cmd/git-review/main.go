@@ -16,7 +16,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.17"
+const version = "0.4.18"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -896,7 +896,29 @@ func projectGroup(ctx context.Context, args []string) error {
 			}
 			err := applyFragmentPatches(ctx, repo, projectionRef, patches, false)
 			if err != nil {
-				return fmt.Errorf("project fragment batch %s: %w", batch[0].Label(), err)
+				completePaths := completeSelectedProjectionPaths(fragments, selected, batch)
+				if !isProjectionLocationFailure(err) || len(completePaths) == 0 {
+					return fmt.Errorf("project fragment batch %s: %w", batch[0].Label(), err)
+				}
+				if _, syncErr := repo.SyncPaths(ctx, projectionRef, "HEAD", completePaths, "project group: synchronize complete paths"); syncErr != nil {
+					return fmt.Errorf("project complete paths %s: %w", strings.Join(completePaths, ", "), syncErr)
+				}
+				completePathSet := stringSet(completePaths)
+				for _, fragment := range fragments {
+					id := fragment.ID()
+					if !selected[id] || materialized[id] || applied[id] {
+						continue
+					}
+					for _, path := range fragment.Paths() {
+						if completePathSet[path] {
+							applied[id] = true
+							appliedIDs = append(appliedIDs, id)
+							break
+						}
+					}
+				}
+				progress = true
+				continue
 			}
 			for _, fragment := range pending {
 				id := fragment.ID()
@@ -1957,6 +1979,48 @@ func applyFragmentPatches(ctx context.Context, repo repository.Repository, ref s
 		}
 		return nil
 	}
+}
+
+func isProjectionLocationFailure(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "ambiguous") ||
+		strings.Contains(message, "not present in the reviewed state") ||
+		strings.Contains(message, "conflicts with the reviewed state")
+}
+
+func completeSelectedProjectionPaths(fragments []session.Fragment, selected map[string]bool, batch []session.Fragment) []string {
+	candidates := map[string]bool{}
+	for _, fragment := range batch {
+		for _, path := range fragment.Paths() {
+			candidates[path] = true
+		}
+	}
+	allByPath := map[string]map[string]bool{}
+	selectedByPath := map[string]map[string]bool{}
+	for _, fragment := range fragments {
+		id := fragment.ID()
+		for _, path := range fragment.Paths() {
+			if allByPath[path] == nil {
+				allByPath[path] = map[string]bool{}
+				selectedByPath[path] = map[string]bool{}
+			}
+			allByPath[path][id] = true
+			if selected[id] {
+				selectedByPath[path][id] = true
+			}
+		}
+	}
+	complete := make([]string, 0)
+	for path := range candidates {
+		all := allByPath[path]
+		selected := selectedByPath[path]
+		if len(all) == 0 || len(all) != len(selected) {
+			continue
+		}
+		complete = append(complete, path)
+	}
+	sort.Strings(complete)
+	return complete
 }
 
 func fragmentBatches(fragments []session.Fragment, selected map[string]bool) [][]session.Fragment {

@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.17\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.17", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.18\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.18", flag, output)
 		}
 	}
 }
@@ -770,6 +770,61 @@ func TestGroupProjectHandlesFragmentAlreadyPresentInBase(t *testing.T) {
 	}
 	if content := runCommand(t, repository, "git", "show", projection.Ref+":example.txt"); content != "new\n" {
 		t.Fatalf("projection content = %q, want new\\n", content)
+	}
+}
+
+func TestGroupProjectUsesCompletePathForSiblingFileAdds(t *testing.T) {
+	repository := newRepository(t, map[string]string{"base.txt": "initial\n"})
+	binary := buildBinary(t)
+	base := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, binary, "init", "--base", "HEAD")
+	contents := []string{
+		"documentation one\n",
+		"documentation two\n",
+		"documentation three\n",
+		"documentation four\n",
+		"documentation five\n",
+	}
+	commits := make([]string, 0, len(contents))
+	for index, content := range contents {
+		runCommand(t, repository, "git", "checkout", "-b", fmt.Sprintf("documentation-%d", index), base)
+		writeFile(t, repository, "SYNC-DOMAIN.md", content)
+		runCommand(t, repository, "git", "add", "SYNC-DOMAIN.md")
+		runCommand(t, repository, "git", "commit", "-m", fmt.Sprintf("documentation change %d", index))
+		commits = append(commits, strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD")))
+	}
+	runCommand(t, repository, "git", "checkout", "main")
+	finalContent := "documentation one\ndocumentation two\ndocumentation three\ndocumentation four\ndocumentation five\n"
+	writeFile(t, repository, "SYNC-DOMAIN.md", finalContent)
+	runCommand(t, repository, "git", "add", "SYNC-DOMAIN.md")
+	tree := strings.TrimSpace(runCommand(t, repository, "git", "write-tree"))
+	commitTreeArgs := []string{"commit-tree", tree, "-p", base}
+	for _, commit := range commits {
+		commitTreeArgs = append(commitTreeArgs, "-p", commit)
+	}
+	commitTreeArgs = append(commitTreeArgs, "-m", "merge documentation changes")
+	mergeCommit := strings.TrimSpace(runCommand(t, repository, "git", commitTreeArgs...))
+	runCommand(t, repository, "git", "update-ref", "refs/heads/main", mergeCommit)
+	runCommand(t, repository, "git", "reset", "--hard", mergeCommit)
+	if fragments := readChanges(t, repository, binary); len(fragments) != len(commits) {
+		t.Fatalf("fragments = %#v, want one sibling fragment per commit", fragments)
+	}
+	for _, commit := range commits {
+		runCommand(t, repository, binary, "group", "add", "--name", "documentation", "--commit", commit)
+	}
+	var projection struct {
+		Fragments []string `json:"fragments"`
+		Blocked   []string `json:"blocked"`
+		Ref       string   `json:"ref"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "project", "--name", "documentation")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Fragments) != len(commits) || len(projection.Blocked) != 0 {
+		t.Fatalf("projection = %#v, want all sibling fragments projected", projection)
+	}
+	if content := runCommand(t, repository, "git", "show", projection.Ref+":SYNC-DOMAIN.md"); content != finalContent {
+		t.Fatalf("projection content = %q, want final merged file", content)
 	}
 }
 
