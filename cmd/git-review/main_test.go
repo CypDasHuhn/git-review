@@ -16,8 +16,8 @@ import (
 func TestVersionFlags(t *testing.T) {
 	binary := buildBinary(t)
 	for _, flag := range []string{"--version", "-v"} {
-		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.18\n" {
-			t.Fatalf("%s output = %q, want git-review 0.4.18", flag, output)
+		if output := runCommand(t, projectRoot(t), binary, flag); output != "git-review 0.4.19\n" {
+			t.Fatalf("%s output = %q, want git-review 0.4.19", flag, output)
 		}
 	}
 }
@@ -741,6 +741,52 @@ func TestGroupProjectHandlesMergeFormattingDrift(t *testing.T) {
 	}
 }
 
+func TestGroupProjectReconstructsPartialPathAfterMergeDrift(t *testing.T) {
+	repository := newRepository(t, map[string]string{"example.txt": "begin\nlegacy\nend\n"})
+	initial := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	runCommand(t, repository, "git", "checkout", "-b", "develop")
+	writeFile(t, repository, "example.txt", "begin\ndevelop\nend\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "develop replacement")
+	runCommand(t, repository, "git", "checkout", "-b", "feature", initial)
+	writeFile(t, repository, "example.txt", "begin\nselected\nend\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "feature replacement")
+	featureCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	writeFile(t, repository, "example.txt", "begin\nselected\nend\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	tree := strings.TrimSpace(runCommand(t, repository, "git", "write-tree"))
+	mergeCommit := strings.TrimSpace(runCommand(t, repository, "git", "commit-tree", tree, "-p", featureCommit, "-p", "develop", "-m", "merge replacements"))
+	runCommand(t, repository, "git", "update-ref", "refs/heads/feature", mergeCommit)
+	runCommand(t, repository, "git", "reset", "--hard", mergeCommit)
+	writeFile(t, repository, "example.txt", "begin\nselected\nend\nother\n")
+	runCommand(t, repository, "git", "add", "example.txt")
+	runCommand(t, repository, "git", "commit", "-m", "other file change")
+	otherCommit := strings.TrimSpace(runCommand(t, repository, "git", "rev-parse", "HEAD"))
+	binary := buildBinary(t)
+	runCommand(t, repository, binary, "init", "--base", "develop")
+	runCommand(t, repository, binary, "group", "add", "--name", "selected", "--commit", featureCommit)
+	runCommand(t, repository, binary, "group", "add", "--name", "other", "--commit", otherCommit)
+	var projection struct {
+		Fragments []string `json:"fragments"`
+		Blocked   []string `json:"blocked"`
+		Ref       string   `json:"ref"`
+	}
+	if err := json.Unmarshal([]byte(runCommand(t, repository, binary, "group", "project", "--name", "selected")), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Fragments) != 1 || len(projection.Blocked) != 0 {
+		t.Fatalf("projection = %#v, want selected fragment reconstructed", projection)
+	}
+	if content := runCommand(t, repository, "git", "show", projection.Ref+":example.txt"); content != "begin\nselected\nend\n" {
+		t.Fatalf("projection content = %q, want selected replacement without other group", content)
+	}
+	runCommand(t, repository, binary, "group", "accept", "--name", "selected", "--path", "example.txt")
+	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("feature")+":example.txt"); content != "begin\nselected\nend\n" {
+		t.Fatalf("reviewed content = %q, want selected replacement without other group", content)
+	}
+}
+
 func TestGroupProjectHandlesFragmentAlreadyPresentInBase(t *testing.T) {
 	repository := newRepository(t, map[string]string{"example.txt": "old\n"})
 	runCommand(t, repository, "git", "checkout", "-b", "develop")
@@ -825,6 +871,10 @@ func TestGroupProjectUsesCompletePathForSiblingFileAdds(t *testing.T) {
 	}
 	if content := runCommand(t, repository, "git", "show", projection.Ref+":SYNC-DOMAIN.md"); content != finalContent {
 		t.Fatalf("projection content = %q, want final merged file", content)
+	}
+	runCommand(t, repository, binary, "group", "accept", "--name", "documentation", "--path", "SYNC-DOMAIN.md")
+	if content := runCommand(t, repository, "git", "show", session.ReviewedRef("main")+":SYNC-DOMAIN.md"); content != finalContent {
+		t.Fatalf("reviewed content after group acceptance = %q, want final merged file", content)
 	}
 }
 

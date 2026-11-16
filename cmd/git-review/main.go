@@ -16,7 +16,7 @@ import (
 	"github.com/CypDasHuhn/git-review/internal/session"
 )
 
-const version = "0.4.18"
+const version = "0.4.19"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -847,6 +847,10 @@ func projectGroup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	currentFragments, err := repo.ReviewFragments(ctx, state.PinnedComparisonCommit, "HEAD")
+	if err != nil {
+		return err
+	}
 	dependencies := fragmentDependencies(fragments)
 	selected := map[string]bool{}
 	for _, fragment := range groups[groupIndex].Fragments {
@@ -897,25 +901,46 @@ func projectGroup(ctx context.Context, args []string) error {
 			err := applyFragmentPatches(ctx, repo, projectionRef, patches, false)
 			if err != nil {
 				completePaths := completeSelectedProjectionPaths(fragments, selected, batch)
-				if !isProjectionLocationFailure(err) || len(completePaths) == 0 {
+				if !isProjectionLocationFailure(err) {
 					return fmt.Errorf("project fragment batch %s: %w", batch[0].Label(), err)
 				}
-				if _, syncErr := repo.SyncPaths(ctx, projectionRef, "HEAD", completePaths, "project group: synchronize complete paths"); syncErr != nil {
-					return fmt.Errorf("project complete paths %s: %w", strings.Join(completePaths, ", "), syncErr)
-				}
-				completePathSet := stringSet(completePaths)
-				for _, fragment := range fragments {
-					id := fragment.ID()
-					if !selected[id] || materialized[id] || applied[id] {
-						continue
+				var appliedByFallback []string
+				if len(completePaths) > 0 {
+					if _, syncErr := repo.SyncPaths(ctx, projectionRef, "HEAD", completePaths, "project group: synchronize complete paths"); syncErr != nil {
+						return fmt.Errorf("project complete paths %s: %w", strings.Join(completePaths, ", "), syncErr)
 					}
-					for _, path := range fragment.Paths() {
-						if completePathSet[path] {
-							applied[id] = true
-							appliedIDs = append(appliedIDs, id)
-							break
+					completePathSet := stringSet(completePaths)
+					for _, fragment := range fragments {
+						id := fragment.ID()
+						if !selected[id] || materialized[id] || applied[id] {
+							continue
+						}
+						for _, path := range fragment.Paths() {
+							if completePathSet[path] {
+								appliedByFallback = append(appliedByFallback, id)
+								break
+							}
 						}
 					}
+				} else {
+					fallbackPaths, fallbackErr := projectionFallbackPaths(ctx, repo, state.PinnedComparisonCommit, currentFragments, selected, materialized, applied, dependencies, batch)
+					if fallbackErr != nil {
+						return fmt.Errorf("project fragment batch %s: %w", batch[0].Label(), fallbackErr)
+					}
+					if len(fallbackPaths) == 0 {
+						return fmt.Errorf("project fragment batch %s: %w", batch[0].Label(), err)
+					}
+					appliedByFallback, err = reconstructProjectionPaths(ctx, repo, projectionRef, currentFragments, selected, materialized, fallbackPaths, "project group: reconstruct paths")
+					if err != nil {
+						return fmt.Errorf("project fragment batch %s: %w", batch[0].Label(), err)
+					}
+				}
+				for _, id := range appliedByFallback {
+					if applied[id] {
+						continue
+					}
+					applied[id] = true
+					appliedIDs = append(appliedIDs, id)
 				}
 				progress = true
 				continue
@@ -1849,6 +1874,10 @@ func materializeAccepted(ctx context.Context, repo repository.Repository, state 
 	if err != nil {
 		return nil, err
 	}
+	currentFragments, err := repo.ReviewFragments(ctx, state.PinnedComparisonCommit, "HEAD")
+	if err != nil {
+		return nil, err
+	}
 	transactionRef := fmt.Sprintf("%s-transaction-%d", state.ReviewedRef, time.Now().UnixNano())
 	if err := repo.CreateRef(ctx, transactionRef, originalHead); err != nil {
 		return nil, err
@@ -1928,7 +1957,61 @@ func materializeAccepted(ctx context.Context, repo repository.Repository, state 
 			}
 			err := applyFragmentPatches(ctx, repo, transactionRef, patches, true)
 			if err != nil {
-				return applied, err
+				if !isProjectionLocationFailure(err) {
+					return applied, err
+				}
+				completePaths := completeSelectedProjectionPaths(fragments, candidates, batch)
+				safeCompletePaths := make([]string, 0, len(completePaths))
+				for _, path := range completePaths {
+					exists, pathErr := repo.PathExists(ctx, state.ReviewedRef, path)
+					if pathErr != nil {
+						return applied, pathErr
+					}
+					if !exists {
+						safeCompletePaths = append(safeCompletePaths, path)
+					}
+				}
+				if len(safeCompletePaths) > 0 {
+					if _, syncErr := repo.SyncPaths(ctx, transactionRef, "HEAD", safeCompletePaths, "accept group: synchronize new paths"); syncErr != nil {
+						return applied, fmt.Errorf("accept new paths %s: %w", strings.Join(safeCompletePaths, ", "), syncErr)
+					}
+					safePathSet := stringSet(safeCompletePaths)
+					for _, candidate := range fragments {
+						id := candidate.ID()
+						if !candidates[id] || materialized[id] {
+							continue
+						}
+						for _, path := range candidate.Paths() {
+							if safePathSet[path] {
+								materialized[id] = true
+								applied = append(applied, id)
+								break
+							}
+						}
+					}
+					progress = true
+					continue
+				}
+				fallbackPaths, fallbackErr := projectionFallbackPaths(ctx, repo, state.PinnedComparisonCommit, currentFragments, candidates, materialized, nil, dependencies, batch)
+				if fallbackErr != nil {
+					return applied, fallbackErr
+				}
+				if len(fallbackPaths) == 0 {
+					return applied, err
+				}
+				materializedByFallback, err := reconstructProjectionPaths(ctx, repo, transactionRef, currentFragments, candidates, materialized, fallbackPaths, "accept group: reconstruct paths")
+				if err != nil {
+					return applied, err
+				}
+				for _, id := range materializedByFallback {
+					if materialized[id] {
+						continue
+					}
+					materialized[id] = true
+					applied = append(applied, id)
+				}
+				progress = true
+				continue
 			}
 			for _, fragment := range pending {
 				id := fragment.ID()
@@ -2021,6 +2104,130 @@ func completeSelectedProjectionPaths(fragments []session.Fragment, selected map[
 	}
 	sort.Strings(complete)
 	return complete
+}
+
+func projectionFallbackPaths(ctx context.Context, repo repository.Repository, pinnedBase string, currentFragments []session.Fragment, selected, materialized, applied map[string]bool, dependencies map[string][]string, batch []session.Fragment) ([]string, error) {
+	candidates := map[string]bool{}
+	for _, fragment := range batch {
+		for _, path := range fragment.Paths() {
+			candidates[path] = true
+		}
+	}
+	currentByPath := map[string][]session.Fragment{}
+	for _, fragment := range currentFragments {
+		for _, path := range fragment.Paths() {
+			currentByPath[path] = append(currentByPath[path], fragment)
+		}
+	}
+	paths := make([]string, 0, len(candidates))
+	for path := range candidates {
+		pathFragments := currentByPath[path]
+		if len(pathFragments) == 0 {
+			continue
+		}
+		pathIDs := stringSet(fragmentIDs(pathFragments))
+		eligible := true
+		divergent := false
+		for _, fragment := range pathFragments {
+			id := fragment.ID()
+			if !selected[id] {
+				continue
+			}
+			contained, err := repo.IsAncestor(ctx, pinnedBase, fragment.Parent)
+			if err != nil {
+				return nil, err
+			}
+			if !contained {
+				divergent = true
+			}
+			for _, dependency := range dependencies[id] {
+				if materialized[dependency] || applied[dependency] {
+					continue
+				}
+				if !selected[dependency] || !pathIDs[dependency] {
+					eligible = false
+					break
+				}
+			}
+			if !eligible {
+				break
+			}
+		}
+		if eligible && divergent {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func reconstructProjectionPaths(ctx context.Context, repo repository.Repository, ref string, currentFragments []session.Fragment, selected, materialized map[string]bool, paths []string, subject string) ([]string, error) {
+	if _, err := repo.SyncPaths(ctx, ref, "HEAD", paths, subject); err != nil {
+		return nil, err
+	}
+	pathSet := stringSet(paths)
+	patchCache := newFragmentPatchCache()
+	for index := len(currentFragments) - 1; index >= 0; index-- {
+		fragment := currentFragments[index]
+		id := fragment.ID()
+		if selected[id] || materialized[id] {
+			continue
+		}
+		touchesPath := false
+		for _, path := range fragment.Paths() {
+			if pathSet[path] {
+				touchesPath = true
+				break
+			}
+		}
+		if !touchesPath {
+			continue
+		}
+		patch, err := patchCache.get(ctx, repo, fragment)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := repo.ApplyFragment(ctx, ref, reverseFragmentPatch(patch)); err != nil {
+			return nil, fmt.Errorf("reverse fragment %s: %w", fragment.Label(), err)
+		}
+	}
+	applied := make([]string, 0)
+	seen := map[string]bool{}
+	for _, fragment := range currentFragments {
+		id := fragment.ID()
+		if !selected[id] || materialized[id] || seen[id] {
+			continue
+		}
+		for _, path := range fragment.Paths() {
+			if pathSet[path] {
+				applied = append(applied, id)
+				seen[id] = true
+				break
+			}
+		}
+	}
+	return applied, nil
+}
+
+func reverseFragmentPatch(patch repository.FragmentPatch) repository.FragmentPatch {
+	fragment := patch.Fragment
+	reversed := fragment
+	reversed.Commit = fragment.Parent
+	reversed.Parent = fragment.Commit
+	reversed.ShortCommit = ""
+	reversed.OldStart = fragment.NewStart
+	reversed.OldLines = fragment.NewLines
+	reversed.NewStart = fragment.OldStart
+	reversed.NewLines = fragment.OldLines
+	if fragment.OldPath != "" && fragment.OldPath != fragment.Path {
+		reversed.Path = fragment.OldPath
+		reversed.OldPath = fragment.Path
+	}
+	return repository.FragmentPatch{
+		Fragment: reversed,
+		OldLines: append([]string{}, patch.NewLines...),
+		NewLines: append([]string{}, patch.OldLines...),
+	}
 }
 
 func fragmentBatches(fragments []session.Fragment, selected map[string]bool) [][]session.Fragment {

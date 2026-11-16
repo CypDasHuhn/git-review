@@ -279,6 +279,19 @@ func (r Repository) DiffPaths(ctx context.Context, left, right string, selectors
 	return strings.Split(output, "\n"), nil
 }
 
+func (r Repository) PathExists(ctx context.Context, ref, path string) (bool, error) {
+	output, err := git(ctx, r.Root, "ls-tree", "-r", "--name-only", ref, "--", path)
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range strings.Split(output, "\n") {
+		if candidate == path {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (r Repository) SyncPaths(ctx context.Context, ref, sourceRef string, paths []string, subject string) (string, error) {
 	head, err := r.ResolveCommit(ctx, ref)
 	if err != nil {
